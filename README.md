@@ -1,6 +1,13 @@
 # dsh-email
 
-Mail plugin for DSH. Reads and sends mail through configured IMAP/SMTP accounts: list and search mailboxes, read messages (without marking them seen), mark flags, save message parts to disk, send/reply/forward with attachments, and manage mailboxes (create/delete folders, move or delete messages - deletion is per-account gated). Accounts are declared in environment variables, optionally overridden by a config layer from a cordis patch file; the plugin keeps no state and pools no connections.
+dsh-email gives a DSH agent working access to a mailbox: the `email` tool reads and sends the user's mail over standard IMAP/SMTP, so the agent can check and answer it with only a password or app-specific password.
+
+- Read and search mail: list, unread view, structured search, read without marking seen
+- Send, reply, forward - with attachments
+- Manage mailboxes: create and delete folders, move messages
+- Multiple accounts in one plugin
+- Deletion is per-account gated: delete and delete_folder run only on accounts that opt in
+- Stateless: one fresh connection per call
 
 ## Installation
 
