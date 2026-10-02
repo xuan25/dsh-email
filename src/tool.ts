@@ -1,5 +1,5 @@
-// dsh-email email tool: one tool, fifteen verbs (accounts, folders, list,
-// list_unseen, search, read, mark, save_part, send, reply, forward,
+// dsh-email email tool: one tool, sixteen verbs (accounts, verify, folders,
+// list, list_unseen, search, read, mark, save_part, send, reply, forward,
 // create_folder, delete_folder, move, delete).
 // The parameter schema is a strict flat declaration: the framework validates
 // arguments against it before execute and rejects type/enum violations. The
@@ -23,13 +23,14 @@ import {
   moveMessages,
   searchUids,
   storeFlags,
+  withImap,
   withImapSession,
 } from './imap-client.js'
 import type { FetchMessageObject, SearchObject } from 'imapflow'
 
 import { analyzeOn, fetchAndAnalyze, hasFlag, quoteText } from './message.js'
 import { savePart } from './save.js'
-import { sendWithAppend } from './smtp-send.js'
+import { sendWithAppend, verifySmtp } from './smtp-send.js'
 import type {
   AccountConfig,
   AnalyzedMessage,
@@ -48,6 +49,7 @@ import { errMsg, LocalError } from './util.js'
 /** The verb set of the email tool. */
 export const VERBS = [
   'accounts',
+  'verify',
   'folders',
   'list',
   'list_unseen',
@@ -80,7 +82,7 @@ export const LIMIT_MIN = 1
 export const LIMIT_MAX = 100
 
 /**
- * Register the email tool (eleven verbs over the EMAIL_* account set).
+ * Register the email tool (sixteen verbs over the EMAIL_* account set).
  * @param ctx cordis Context (the host must have loaded the dsh-tools service).
  * @param cfg the parsed EMAIL_* config captured at boot (env is static per container boot).
  * @returns framework effect disposer (unregisters the tool when the fiber is unloaded).
@@ -91,7 +93,9 @@ export function registerTool(ctx: Context, cfg: EmailConfig): () => void {
       name: 'email',
       description:
         'Read and send mail through configured IMAP/SMTP accounts (EMAIL_* env). ' +
-        'accounts lists the configured accounts; folders lists mailboxes; list/list_unseen/search return ' +
+        'accounts lists the configured accounts; verify checks every configured account live with zero ' +
+        'side effects (IMAP login plus SMTP authentication - no message is delivered, created, or modified); ' +
+        'folders lists mailboxes; list/list_unseen/search return ' +
         'paginated message summaries (newest first); read returns the analyzed message (parts list plus the ' +
         'first text or html body, truncated to the read-body budget); mark stores flags; save_part writes one ' +
         'part to disk; send/reply/forward deliver a message (and copy it to the account SENT_FOLDER when set, ' +
@@ -103,7 +107,7 @@ export function registerTool(ctx: Context, cfg: EmailConfig): () => void {
         'dsh-email skill.',
       parameters: {
         verb: { type: 'string', required: true, enum: VERBS, description: 'The verb to execute.' },
-        account: { type: 'string', description: 'Account name. Absent: EMAIL_DEFAULT_ACCOUNT, or the sole configured account.' },
+        account: { type: 'string', description: 'Account name. Absent: EMAIL_DEFAULT_ACCOUNT, or the sole configured account. verify ignores it (it checks every configured account).' },
         folder: { type: 'string', description: 'Mailbox path (default INBOX). For move this is the SOURCE folder.' },
         dest: { type: 'string', description: 'move: the target mailbox. It must already exist and is never auto-created; for any other verb this is ignored.' },
         limit: { type: 'integer', description: `Page size for list/list_unseen/search (default ${DEFAULT_LIMIT}, clamped to ${LIMIT_MIN}-${LIMIT_MAX}).` },
@@ -192,6 +196,26 @@ function errorCodeOf(err: unknown): ErrorCode | undefined {
     return (['auth', 'network', 'tls', 'timeout', 'protocol', 'server'] as const).includes(code as never) ? (code as ErrorCode) : undefined
   }
   return undefined
+}
+
+/**
+ * Run one verify channel and fold its outcome into the channel result: a
+ * success is the bare `{ ok: true }`; a failure carries the raw upstream text
+ * plus the classified code when the closed vocabulary names one (local
+ * errors carry none). The channel never throws: one channel's failure must
+ * not mask the other channel's or another account's result.
+ * @param run the channel check (a fresh connection under the account budget).
+ */
+async function channelResult(run: () => Promise<unknown>): Promise<Record<string, unknown>> {
+  try {
+    await run()
+    return { ok: true }
+  } catch (err) {
+    const out: Record<string, unknown> = { ok: false, error: errMsg(err) }
+    const code = errorCodeOf(err)
+    if (code !== undefined) out.code = code
+    return out
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +494,26 @@ const OPS: Record<Verb, (cfg: EmailConfig, args: Args) => Promise<unknown>> = {
         isDefault: a.isDefault,
       })),
     }
+  },
+
+  async verify(cfg) {
+    // A diagnostic verb over the whole configured account set (the account
+    // argument is ignored, the same convention as `accounts`): every account
+    // is checked on both channels, each channel on its own fresh connection
+    // under the account timeout budget, so one account's or one channel's
+    // failure never masks the rest. Zero side effects: the IMAP channel is a
+    // login only (no mailbox is selected, nothing is read or modified); the
+    // SMTP channel stops after authentication - no message is ever delivered.
+    const accountResults = await Promise.all(
+      cfg.accounts.map(async (acct) => {
+        const [imap, smtp] = await Promise.all([
+          channelResult(() => withImap(acct, '', async () => undefined)),
+          channelResult(() => verifySmtp(acct)),
+        ])
+        return { name: acct.name, ok: imap.ok === true && smtp.ok === true, imap, smtp }
+      }),
+    )
+    return { accounts: accountResults }
   },
 
   async folders(cfg, args) {

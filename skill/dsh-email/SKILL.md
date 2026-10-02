@@ -1,7 +1,7 @@
 ---
 name: dsh-email
-description: "Read and send mail through configured IMAP/SMTP accounts (EMAIL_* env) with the email tool: accounts/folders discovery, list/list_unseen/search, read, mark, save_part, send/reply/forward, and mailbox management (create_folder/delete_folder/move/delete, the destructive verbs gated per account)."
-whenToUse: "When a task must read, search, mark, or save mail from a configured mailbox, must send, reply to, or forward a message through a configured SMTP account, or must manage mailboxes (create or delete folders, move or delete messages; deletion is per-account gated)."
+description: "Read and send mail through configured IMAP/SMTP accounts (EMAIL_* env) with the email tool: accounts/verify/folders discovery, list/list_unseen/search, read, mark, save_part, send/reply/forward, and mailbox management (create_folder/delete_folder/move/delete, the destructive verbs gated per account). verify checks every configured account live (IMAP login + SMTP authentication) with zero side effects."
+whenToUse: "When a task must read, search, mark, or save mail from a configured mailbox, must send, reply to, or forward a message through a configured SMTP account, must verify that the configured accounts actually connect and authenticate (verify, zero side effects), or must manage mailboxes (create or delete folders, move or delete messages; deletion is per-account gated)."
 ---
 
 # dsh-email
@@ -12,6 +12,7 @@ Mail access (IMAP receive + SMTP send) over the accounts declared in the EMAIL_*
 
 ```
 email { verb: "accounts" }
+email { verb: "verify" }        # live connectivity + credentials per account, zero side effects
 email { verb: "folders" }
 email { verb: "list_unseen" }
 email { verb: "read", folder: "INBOX", uid: 42 }
@@ -49,11 +50,12 @@ folder (query folders first for the real mailbox names); new mail = repeat 1-4
 
 ## Verb reference
 
-`account` (optional, all verbs): the account name. Absent: EMAIL_DEFAULT_ACCOUNT, or the sole configured account. `folder` (optional, default `INBOX`): the mailbox path (real names from the `folders` verb); it becomes required - no default - for `create_folder`, `delete_folder`, and `move` (as the source mailbox). `dest` (required for `move`, ignored by every other verb): the target mailbox of a move; it must already exist and is never auto-created. `limit` (default 25, clamped 1-100) and `page` (zero-based, default 0): pagination for the list family; the window is sliced over the matching uids, newest first (uid descending as the tiebreak). `date` in results is the server INTERNALDATE (when the server received the message), ISO 8601 UTC. `seen?` / `flagged?` (optional booleans on `list` / `list_unseen` / `search`) are filters on the same two flags the result rows report and `mark` writes: true = only messages with that flag set, false = only messages without it, absent = no constraint; in `mark` the same names take the mutation role (true = set, false = clear).
+`account` (optional, all verbs except `verify`): the account name. Absent: EMAIL_DEFAULT_ACCOUNT, or the sole configured account. `verify` ignores it: it checks every configured account (the same convention as `accounts`). `folder` (optional, default `INBOX`): the mailbox path (real names from the `folders` verb); it becomes required - no default - for `create_folder`, `delete_folder`, and `move` (as the source mailbox). `dest` (required for `move`, ignored by every other verb): the target mailbox of a move; it must already exist and is never auto-created. `limit` (default 25, clamped 1-100) and `page` (zero-based, default 0): pagination for the list family; the window is sliced over the matching uids, newest first (uid descending as the tiebreak). `date` in results is the server INTERNALDATE (when the server received the message), ISO 8601 UTC. `seen?` / `flagged?` (optional booleans on `list` / `list_unseen` / `search`) are filters on the same two flags the result rows report and `mark` writes: true = only messages with that flag set, false = only messages without it, absent = no constraint; in `mark` the same names take the mutation role (true = set, false = clear).
 
 | verb | Parameters (defaults) | Result |
 |---|---|---|
 | `accounts` | none | `{ default, accounts: [{ name, user, from, imap: {host, port, tls, certVerify?}, smtp: {host, port, tls, certVerify?}, sentFolder?, sentFolderAutocreate, allowDelete, isDefault }] }` - `tls` is the mode (`none`/`tls`/`starttls`); `certVerify` is `strict`/`insecure`, omitted for the `none` mode; `allowDelete` mirrors `EMAIL_<N>_ALLOW_DELETE` (default false). Local only, zero network, never shows credentials. |
+| `verify` | none (the `account` parameter is ignored) | `{ accounts: [{ name, ok, imap: { ok } \| { ok, error, code? }, smtp: { ok } \| { ok, error, code? } }] }` - live, zero side effects: the IMAP channel is a fresh login only (no mailbox selected, nothing read or modified); the SMTP channel connects and authenticates but never delivers (no MAIL FROM / RCPT / DATA). The two channels run in parallel, each on its own fresh connection under the account timeout budget; one channel's or one account's failure never masks the rest. The per-account `ok` = both channels green; a channel failure carries the raw upstream text plus the classified code when one applies. Every configured account is reported; zero accounts yields `{ accounts: [] }`. It proves reachability + TLS + credentials, not end-to-end delivery (a real send covers queue/relay). |
 | `folders` | `account?` | `{ account, folders: [{ name, subscribed }] }` - IMAP LIST, real names (non-ASCII names included). |
 | `list` | `account?` / `folder` / `seen?` / `flagged?` / `limit` / `page` | `{ account, folder, total, page, limit, messages: [{ uid, messageId?, from?, to?, subject?, date?, seen, flagged }] }` newest first. |
 | `list_unseen` | same as `list` | Same as `list` with the `seen: false` predicate preset (an explicit `seen: true` is a local error; `flagged` ANDs with it). |

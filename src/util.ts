@@ -193,6 +193,11 @@ export function classifyError(err: unknown): ErrorCode | undefined {
     if (code === 'EMESSAGE' && FIVE_X_RE.test(err.message)) return 'server'
     if (code === 'ECONNECTION') return classifyCauseOr(err)
     if (code === 'ETIMEDOUT') return 'timeout'
+    // nodemailer labels a socket-plane failure (refused, reset, a broken
+    // TLS negotiation) ESOCKET without a structured cause; the plane comes
+    // from the message: certificate and TLS-negotiation texts are tls, a
+    // timeout token is timeout, everything else is the network plane
+    if (code === 'ESOCKET') return classifySocketPlane(err)
     if (NETWORK_CODES.has(code)) return 'network'
     if (TLS_CODES.has(code) || code.startsWith('ERR_TLS_') || code.startsWith('ERR_SSL_')) return 'tls'
   }
@@ -255,6 +260,27 @@ function classifyByMessage(err: Error): ErrorCode | undefined {
   }
   if (/getaddrinfo|dns/i.test(msg) && /ENOTFOUND|EAI_AGAIN/.test(msg)) return 'network'
   return undefined
+}
+
+/**
+ * Classify one nodemailer ESOCKET error from its message: the library attaches
+ * no structured cause, so the plane is read from the text. Certificate and
+ * TLS-negotiation failures are tls, a timeout token is timeout, and the
+ * remaining socket-plane failures (refused, reset, a broken handshake that
+ * surfaces as a plain socket drop) are network.
+ * @param err the ESOCKET-carrying error.
+ */
+function classifySocketPlane(err: Error): ErrorCode {
+  const msg = err.message
+  // The alternatives cover the failure texts this stack emits: Node/OpenSSL
+  // certificate and handshake errors (several originate in the embedded node
+  // core TLS layer, so they appear in no dependency dist), the STARTTLS
+  // refusal, and a TLS-configured socket dropped by a plaintext peer.
+  if (/self[- ]signed|unable to verify|certificate is not trusted|certificate has expired|altname|wrong version number|secure tls connection was established|ssl routines|openssl internal error|starttls/i.test(msg)) {
+    return 'tls'
+  }
+  if (/ETIMEDOUT/.test(msg)) return 'timeout'
+  return 'network'
 }
 
 /**

@@ -1,6 +1,6 @@
 // dsh-email selftest: drives the shipped lib/ build against in-process fake
 // IMAP/SMTP servers (loopback) and asserts the full behavior contract: the
-// EMAIL_* env matrix, account resolution, the fifteen tool verbs (wire-level
+// EMAIL_* env matrix, account resolution, the sixteen tool verbs (wire-level
 // assertions on the fake servers for SEARCH construction, PEEK semantics,
 // flag store, APPEND source identity, SMTP envelope and MIME shape, mailbox
 // create/delete, uid-scoped copy+expunge moves), the
@@ -442,9 +442,9 @@ async function withServer(start, fn) {
   eq('constants: plugin name', PLUGIN_NAME, 'dsh-email')
   eq('constants: plugin version', PLUGIN_VERSION, '0.1.0')
   eq(
-    'constants: verb set (15)',
+    'constants: verb set (16)',
     [...VERBS],
-    ['accounts', 'folders', 'list', 'list_unseen', 'search', 'read', 'mark', 'save_part', 'send', 'reply', 'forward', 'create_folder', 'delete_folder', 'move', 'delete'],
+    ['accounts', 'verify', 'folders', 'list', 'list_unseen', 'search', 'read', 'mark', 'save_part', 'send', 'reply', 'forward', 'create_folder', 'delete_folder', 'move', 'delete'],
   )
   eq('constants: default folder', DEFAULT_FOLDER, 'INBOX')
   eq('constants: limit default/min/max', [DEFAULT_LIMIT, LIMIT_MIN, LIMIT_MAX], [25, 1, 100])
@@ -1179,6 +1179,206 @@ async function withServer(start, fn) {
           })(),
       ),
   )
+}
+
+// ---------------------------------------------------------------------------
+// 15c. verify verb: a zero-side-effect live check of every configured account
+// ---------------------------------------------------------------------------
+{
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      withServer(
+        () => startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: inboxMessages() } }, subscribed: ['INBOX'] }),
+        (imap) =>
+          (async () => {
+            const d = makeDriver({ ...envOne('main', { imapPort: imap.port, smtpPort: smtp.port }) })
+            const r = doc(await d.execute({ verb: 'verify' }))
+            eq('verify: both channels green on every configured account', r, {
+              accounts: [{ name: 'main', ok: true, imap: { ok: true }, smtp: { ok: true } }],
+            })
+            ok('verify: the success doc carries no call-level ok field', r && !('ok' in r))
+            const conn = lastConn(smtp.state)
+            ok('verify: the SMTP side authenticated', conn && conn.authUser === 'agent')
+            eq('verify: the SMTP side delivered nothing (envelope and data empty)', [conn.from, conn.rcpts, conn.data], [null, [], null])
+            eq(
+              'verify: the IMAP side logged in but touched no mailbox',
+              [imapCmd(imap.state, 'SELECT').length, imapCmd(imap.state, 'STORE').length, imapCmd(imap.state, 'APPEND').length, imapCmd(imap.state, 'LOGIN').length >= 1],
+              [0, 0, 0, true],
+            )
+            const r2 = doc(await d.execute({ verb: 'verify', account: 'nonexistent' }))
+            eq('verify: the account parameter is ignored (every configured account is reported)', r2 && r2.accounts.map((a) => a.name), ['main'])
+          })(),
+      ),
+  )
+  await withServer(
+    () => startSmtpServer({ mode: 'starttls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      withServer(
+        () => startImapServer({ mode: 'starttls', users: { agent: 'secret' }, folders: { INBOX: { messages: inboxMessages() } }, subscribed: ['INBOX'] }),
+        (imap) =>
+          (async () => {
+            const d = makeDriver({ ...envOne('main', { imapPort: imap.port, smtpPort: smtp.port, imapTls: 'starttls', smtpTls: 'starttls' }) })
+            const r = doc(await d.execute({ verb: 'verify' }))
+            eq('verify: starttls mode upgrades both channels and authenticates', r, {
+              accounts: [{ name: 'main', ok: true, imap: { ok: true }, smtp: { ok: true } }],
+            })
+            ok(
+              'verify: the IMAP wire shows a STARTTLS upgrade before the login',
+              imap.state.commands.includes('STARTTLS') && imapCmd(imap.state, 'LOGIN').length >= 1,
+            )
+            const conn = lastConn(smtp.state)
+            ok('verify: the SMTP wire shows a STARTTLS upgrade', conn && conn.rawCommands.some((x) => x.startsWith('STARTTLS')))
+            ok('verify: the starttls run still delivered nothing', conn && conn.from === null && conn.rcpts.length === 0 && conn.data === null)
+          })(),
+      ),
+  )
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      withServer(
+        () => startImapServer({ mode: 'tls', users: { agent: 'other' }, folders: { INBOX: { messages: [] } } }),
+        (imap) =>
+          (async () => {
+            const d = makeDriver({ ...envOne('main', { imapPort: imap.port, smtpPort: smtp.port }) })
+            const r = doc(await d.execute({ verb: 'verify' }))
+            const row = r && r.accounts[0]
+            ok('verify: an IMAP credential failure is code auth, channel-local', row && row.ok === false && row.imap.ok === false && row.imap.code === 'auth', row)
+            ok('verify: the SMTP channel stays green and isolated', row && row.smtp.ok === true)
+            ok(
+              'verify: the failure output leaks no credential',
+              row && !String(row.imap.error).includes('secret') && !String(row.smtp.error ?? '').includes('secret'),
+            )
+            const conn = lastConn(smtp.state)
+            ok(
+              'verify: the green SMTP channel authenticated with zero delivery',
+              conn && conn.authUser === 'agent' && conn.from === null && conn.rcpts.length === 0 && conn.data === null,
+            )
+          })(),
+      ),
+  )
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'other' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      withServer(
+        () => startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } } }),
+        (imap) =>
+          (async () => {
+            const d = makeDriver({ ...envOne('main', { imapPort: imap.port, smtpPort: smtp.port }) })
+            const r = doc(await d.execute({ verb: 'verify' }))
+            const row = r && r.accounts[0]
+            ok('verify: an SMTP credential failure is code auth, channel-local', row && row.ok === false && row.smtp.ok === false && row.smtp.code === 'auth', row)
+            ok('verify: the IMAP channel stays green and isolated', row && row.imap.ok === true)
+            ok('verify: the SMTP failure text leaks no credential', row && !String(row.smtp.error).includes('secret'))
+            eq('verify: the green IMAP side logged in only', imapCmd(imap.state, 'SELECT').length, 0)
+          })(),
+      ),
+  )
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      (async () => {
+        const d = makeDriver({ ...envOne('main', { imapPort: 1, smtpPort: smtp.port }) })
+        const r = doc(await d.execute({ verb: 'verify' }))
+        const row = r && r.accounts[0]
+        ok('verify: an unreachable IMAP endpoint is code network', row && row.ok === false && row.imap.code === 'network', row)
+        ok('verify: the SMTP channel is unaffected by the IMAP failure', row && row.smtp.ok === true)
+      })(),
+  )
+  {
+    const imap = await startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } } })
+    try {
+      const d = makeDriver({ ...envOne('main', { imapPort: imap.port, smtpPort: 1 }) })
+      const r = doc(await d.execute({ verb: 'verify' }))
+      const row = r && r.accounts[0]
+      ok('verify: an unreachable SMTP endpoint is code network', row && row.ok === false && row.smtp.code === 'network', row)
+      ok('verify: the IMAP channel is unaffected by the SMTP failure', row && row.imap.ok === true)
+    } finally {
+      await imap.stop()
+    }
+  }
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      (async () => {
+        const imap = await startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } } })
+        try {
+          const d = makeDriver({ ...envOne('strict', { imapPort: imap.port, smtpPort: smtp.port, imapInsecure: false, smtpInsecure: false }) })
+          const r = doc(await d.execute({ verb: 'verify' }))
+          const row = r && r.accounts[0]
+          ok(
+            'verify: strict certificate validation fails both channels as tls',
+            row && row.ok === false && row.imap.code === 'tls' && row.smtp.code === 'tls',
+            row,
+          )
+        } finally {
+          await imap.stop()
+        }
+      })(),
+  )
+  await withServer(
+    () => startSmtpServer({ mode: 'starttls', starttlsAdvertised: false, users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      (async () => {
+        const imap = await startImapServer({ mode: 'starttls-none', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } } })
+        try {
+          const d = makeDriver({ ...envOne('plain', { imapPort: imap.port, smtpPort: smtp.port, imapTls: 'starttls', smtpTls: 'starttls' }) })
+          const r = doc(await d.execute({ verb: 'verify' }))
+          const row = r && r.accounts[0]
+          ok(
+            'verify: a mandatory STARTTLS endpoint without it fails both channels as tls (never a plaintext downgrade)',
+            row && row.ok === false && row.imap.code === 'tls' && row.smtp.code === 'tls',
+            row,
+          )
+        } finally {
+          await imap.stop()
+        }
+      })(),
+  )
+  {
+    const imap = await startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } }, inject: { hangGreeting: true } })
+    const smtp = await startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] })
+    try {
+      const d = makeDriver({ ...envOne('slow', { imapPort: imap.port, smtpPort: smtp.port, timeout: 400 }) })
+      const r = doc(await d.execute({ verb: 'verify' }))
+      const row = r && r.accounts[0]
+      ok('verify: a silent IMAP greeting is code timeout', row && row.ok === false && row.imap.code === 'timeout', row)
+      ok('verify: the SMTP channel completes under its own budget while the IMAP channel hangs', row && row.smtp.ok === true)
+    } finally {
+      await imap.stop()
+      await smtp.stop()
+    }
+  }
+  await withServer(
+    () => startSmtpServer({ mode: 'tls', users: { agent: 'secret' }, authOrder: ['PLAIN', 'LOGIN'] }),
+    (smtp) =>
+      withServer(
+        () => startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: [] } }, subscribed: ['INBOX'] }),
+        (imap) =>
+          (async () => {
+            const d = makeDriver({
+              ...envOne('good', { imapPort: imap.port, smtpPort: smtp.port }),
+              ...envOne('broken', { imapPort: 1, smtpPort: smtp.port }),
+            })
+            const r = doc(await d.execute({ verb: 'verify' }))
+            const by = (n) => r && r.accounts.find((a) => a.name === n)
+            eq('verify: every configured account is reported, bad and good together', r && r.accounts.map((a) => a.name).sort(), ['broken', 'good'])
+            ok('verify: the good account is fully green', by('good') && by('good').ok === true && by('good').imap.ok === true && by('good').smtp.ok === true, by('good'))
+            const broken = by('broken')
+            ok(
+              'verify: the broken account reports its IMAP failure without masking the green SMTP channel',
+              broken && broken.ok === false && broken.imap.code === 'network' && broken.smtp.ok === true,
+              broken,
+            )
+          })(),
+      ),
+  )
+  {
+    const d = makeDriver({})
+    const r = doc(await d.execute({ verb: 'verify' }))
+    eq('verify: zero configured accounts is a legitimate empty result set', r, { accounts: [] })
+    ok('verify: the empty result carries no call-level ok field', r && !('ok' in r))
+  }
 }
 
 // ---------------------------------------------------------------------------

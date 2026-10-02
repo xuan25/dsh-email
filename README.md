@@ -3,6 +3,7 @@
 dsh-email gives a DSH agent working access to a mailbox: the `email` tool reads and sends the user's mail over standard IMAP/SMTP, so the agent can check and answer it with only a password or app-specific password.
 
 - Read and search mail: list, unread view, structured search, read without marking seen
+- Verify account health: verify checks every configured account live (IMAP login + SMTP authentication) with zero side effects
 - Send, reply, forward - with attachments
 - Manage mailboxes: create and delete folders, move messages
 - Multiple accounts in one plugin
@@ -78,10 +79,11 @@ An optional config layer sits on top of the env block: a patch entry targeting t
 
 ## Usage
 
-The plugin adds the `email` tool and the `dsh-email` skill (verb reference, env contract details, limits, troubleshooting). The fifteen verbs, one line each:
+The plugin adds the `email` tool and the `dsh-email` skill (verb reference, env contract details, limits, troubleshooting). The sixteen verbs, one line each:
 
 ```
 email { verb: "accounts" }                                  # configured accounts (local, no network)
+email { verb: "verify" }                                    # live connectivity + credentials, zero side effects
 email { verb: "folders" }                                    # mailbox names
 email { verb: "list", flagged: true }                       # newest-first summaries, flagged only
 email { verb: "list_unseen" }                                # the unread view

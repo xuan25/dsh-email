@@ -7,7 +7,7 @@
 // parsing (foldConfig in config.ts). Pure transport: no pooling, no idle
 // keep-alive, no state; every verb call opens one fresh connection under the
 // account timeout budget. The constructor registers exactly three things: the
-// email tool (fifteen verbs), the bundled dsh-email skill, and a one-line
+// email tool (sixteen verbs), the bundled dsh-email skill, and a one-line
 // system-prompt pointer.
 import Schema from '@deepseek-ai/schemastery'
 import { Service, type Context } from '@deepseek-ai/cordis'

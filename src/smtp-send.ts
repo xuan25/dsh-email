@@ -112,11 +112,33 @@ function fail(acct: AccountConfig, err: unknown): never {
 }
 
 /**
- * Deliver one pre-composed MIME source over a fresh SMTP connection from the
- * account TLS mode: 'tls' is a direct handshake, 'starttls' is a mandatory
- * STARTTLS upgrade (a server without it fails the send, never a plaintext
- * downgrade), and 'none' stays on plaintext without ever attempting STARTTLS.
- * Password auth uses the account credentials. The explicit envelope carries
+ * The transport options for one account, shared by the send and the verify
+ * paths so both run against the identical connection contract: 'tls' is a
+ * direct handshake, 'starttls' is a mandatory STARTTLS upgrade (a server
+ * without it fails the call, never a plaintext downgrade), and 'none' stays
+ * on plaintext without ever attempting STARTTLS. Password auth uses the
+ * account credentials; the certificate-validation downgrade mirrors the
+ * operator's allowInsecure field (Node's rejectUnauthorized is the negation).
+ * @param acct the account config.
+ */
+function transportOptionsFor(acct: AccountConfig) {
+  return {
+    host: acct.smtp.host,
+    port: acct.smtp.port,
+    secure: acct.smtp.tls === 'tls',
+    requireTLS: acct.smtp.tls === 'starttls',
+    ignoreTLS: acct.smtp.tls === 'none',
+    auth: { user: acct.user, pass: acct.pass },
+    tls: { rejectUnauthorized: !acct.smtp.allowInsecure },
+    connectionTimeout: acct.timeoutMs,
+    socketTimeout: acct.timeoutMs,
+    logger: false,
+  }
+}
+
+/**
+ * Deliver one pre-composed MIME source over a fresh SMTP connection (the
+ * transport options from the shared builder). The explicit envelope carries
  * the full recipient set including Bcc.
  * @param acct the sending account.
  * @param source the composed MIME source.
@@ -124,32 +146,35 @@ function fail(acct: AccountConfig, err: unknown): never {
  * @returns the message id reported by the transport (parsed from the source).
  */
 export async function deliver(acct: AccountConfig, source: string, envelope: { from: string; to: string[] }): Promise<string> {
-  const transport = createTransport({
-    host: acct.smtp.host,
-    port: acct.smtp.port,
-    // 'tls' is a direct handshake; every other mode starts on plaintext.
-    secure: acct.smtp.tls === 'tls',
-    // 'starttls' makes STARTTLS mandatory: the client fails the send when the
-    // server lacks STARTTLS instead of continuing unencrypted (the library's
-    // opportunistic default is the plaintext hole); it takes precedence over
-    // the opportunistic fallback. 'none' disables STARTTLS entirely.
-    requireTLS: acct.smtp.tls === 'starttls',
-    // 'none' ignores the server's STARTTLS capability even when advertised,
-    // so the session stays on plaintext (never used together with requireTLS).
-    ignoreTLS: acct.smtp.tls === 'none',
-    auth: { user: acct.user, pass: acct.pass },
-    // The account field carries the operator-facing semantics of the env
-    // variable (default false = strict validation; true = explicitly accept
-    // untrusted / self-signed certificates). Node's rejectUnauthorized is the
-    // negation, so the mapping inverts it at the connection boundary.
-    tls: { rejectUnauthorized: !acct.smtp.allowInsecure },
-    connectionTimeout: acct.timeoutMs,
-    socketTimeout: acct.timeoutMs,
-    logger: false,
-  })
+  const transport = createTransport(transportOptionsFor(acct))
   try {
     const info = await transport.sendMail({ raw: source, envelope })
     return info.messageId
+  } catch (err) {
+    throw fail(acct, err)
+  } finally {
+    try {
+      transport.close()
+    } catch {
+      // best-effort close: a transport that never connected has nothing to close
+    }
+  }
+}
+
+/**
+ * Verify the SMTP endpoint of one account with zero side effects: one fresh
+ * connection running connect + EHLO + the account TLS mode (STARTTLS when
+ * configured as mandatory) + password authentication (when the server
+ * advertises AUTH) + QUIT. No MAIL FROM / RCPT / DATA is ever sent, so the
+ * call proves reachability, the TLS negotiation, and - on servers that
+ * authenticate - the credentials, without delivering anything. A failure
+ * carries the classified code of the send path.
+ * @param acct the account to verify.
+ */
+export async function verifySmtp(acct: AccountConfig): Promise<void> {
+  const transport = createTransport(transportOptionsFor(acct))
+  try {
+    await transport.verify()
   } catch (err) {
     throw fail(acct, err)
   } finally {
