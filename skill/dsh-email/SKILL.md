@@ -6,7 +6,7 @@ whenToUse: "When a task must read, search, mark, or save mail from a configured 
 
 # dsh-email
 
-Mail access (IMAP receive + SMTP send) over the accounts declared in the EMAIL_* env contract. The plugin is stateless: every call opens one fresh connection (closed after the call), runs under the account's timeout budget, and never pools or keeps connections alive. "Unread" is the server-side UNSEEN flag. Every read is PEEK-based: reading a message never flips it to seen; use `mark` to change flags.
+Mail access (IMAP receive + SMTP send) over the accounts declared in the EMAIL_* env contract (optionally overridden by the config layer below). The plugin is stateless: every call opens one fresh connection, runs under the account's timeout budget, and never pools or keeps connections alive. "Unread" is the server-side UNSEEN flag. Every read is PEEK-based: reading a message never flips it to seen; use `mark` to change flags.
 
 ## Quick reference
 
@@ -26,7 +26,7 @@ email { verb: "delete", folder: "INBOX", uids: [42] }        # gated: EMAIL_<N>_
 email { verb: "delete_folder", folder: "Archive" }           # gated: EMAIL_<N>_ALLOW_DELETE
 ```
 
-All results are JSON documents (success carries no `ok` field). Failures are `{ ok: false, error, code? }`; `code` is present only for transport origins: `auth`, `network`, `tls`, `timeout`, `protocol`, `server`. Local validation errors (missing verb/parameter, ambiguous part, ...) carry no code and the error text says what to fix.
+All results are JSON documents (success carries no `ok` field). Failures are `{ ok: false, error, code? }`; `code` is a transport origin (`auth`/`network`/`tls`/`timeout`/`protocol`/`server`, see Failure semantics) and is absent for local validation errors, whose text says what to fix.
 
 ## Standard receive flow
 
@@ -109,6 +109,34 @@ EMAIL_LOCAL_SMTP_PORT=587
 EMAIL_LOCAL_SENT_FOLDER=Sent
 ```
 
+## Config layer (profile patch)
+
+An optional config layer sits on top of the env contract: a cordis patch entry targeting the plugin id `dsh-email` (the profile's `cordis.patch.yml`, the user-global `~/.dsh/cordis.patch.yml`, or a `--patch` overlay) carries a `config` object whose keys are camelCase mirrors of the env fields above, every key optional:
+
+- `defaultAccount` - mirror of `EMAIL_DEFAULT_ACCOUNT`
+- `readBodyLimit` - positive integer, mirror of `EMAIL_READ_BODY_LIMIT`
+- `accounts` - a map of account name (same charset as the env account names) to per-account keys, camelCase mirrors of the `EMAIL_<N>_*` fields: `user`, `pass`, `imapHost`, `imapPort` (integer 1-65535), `imapSecure` (`tls` / `starttls` / `none`, case-insensitive), `imapAllowInsecureTls`, `smtpHost`, `smtpPort` (integer 1-65535), `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs` (positive integer ms)
+
+Example:
+
+```yaml
+- id: dsh-email
+  config:
+    readBodyLimit: 500
+    accounts:
+      default:
+        imapPort: 1043
+```
+
+Semantics:
+
+- One precedence chain: delivered value > env value > built-in default. Keys the layer omits resolve as the env contract, so `config: {}` (or no entry) is exactly the env-only behavior. A config account missing a required field is dropped with a boot warning, the same rule as env.
+- A patch targets a row by id and replaces its whole config: no deep merge, so a layer that overrides one field restates the fields it keeps. Layer order (later replaces earlier): the plugin's own default entry, the profile patch, the user-global patch, any `--patch` overlay - framework semantics.
+- Validation: the layer is validated against a schema before the plugin starts; an unknown key or an out-of-range value (ports 1-65535, positive-integer `timeoutMs` / `readBodyLimit`, the three TLS words, the account-name charset) fails the plugin entry at load. Incomplete account data still only warns, as in the env contract.
+- Live effect: with the live patch reload, editing the patch file re-runs the plugin's constructor without a restart (the plugin is stateless, the next call uses the new values); otherwise the change applies at the next restart.
+- Permissions: the agent edits the patch file directly as a plain file operation, under its own file permissions; the plugin provides no tool for changing its own configuration. When the file is not writable, report that honestly; do not work around it.
+- Provenance: the `accounts` verb presents values only; a value's source is verified on demand against the patch files and the env contract above.
+
 ## Limits
 
 - Read body: first text (else first html) part, truncated to EMAIL_READ_BODY_LIMIT (default 20000 characters); `totalLength` reports the pre-truncation length; `save_part` is the escape hatch for the full part.
@@ -117,7 +145,7 @@ EMAIL_LOCAL_SENT_FOLDER=Sent
 - `search` dates: since inclusive / until exclusive (IMAP SINCE/BEFORE on INTERNALDATE).
 - Known issue (upstream imapflow 2.2.1, not yet fixed): on servers advertising IMAP `WITHIN` (Dovecot does), date criteria are unreliable - `until` alone returns no messages, and `since` + `until` together silently drop the `until` side. Avoid `since`/`until` on such servers until the upstream rewrite (SINCE/BEFORE to YOUNGER/OLDER seconds) is fixed.
 - `has_attachment` matches only parts with an explicit attachment Content-Disposition; inline parts do not count.
-- No IDLE / no push: poll with list_unseen (compose with a scheduler for periodic checks). No subscribe/unsubscribe verbs (mailbox subscriptions stay with the user's mail clients). `delete` and `delete_folder` are fail-closed: denied unless the account opts in with `EMAIL_<N>_ALLOW_DELETE=true`. No XOAUTH2 (password / app-specific password only).
+- No IDLE / no push: poll with list_unseen (compose with a scheduler for periodic checks). No subscribe/unsubscribe verbs (mailbox subscriptions stay with the user's mail clients). No XOAUTH2 (password / app-specific password only).
 - No client-side attachment size pre-check: a server rejection (size limits etc.) surfaces as a `server` error with the server's own text.
 
 ## Failure semantics

@@ -1,14 +1,22 @@
-// dsh-email configuration: the EMAIL_* env contract (read once at plugin boot).
-// An account is declared by any EMAIL_<NAME>_<FIELD> variable; the account is
-// valid only when the four required fields (USER, PASS, IMAP_HOST, SMTP_HOST)
-// are all present and the effective FROM (the FROM value, else USER) is a
-// mailbox address (a local part and a domain around an @), otherwise it is
-// dropped with a warning (boot never fails). The FROM shape is validated at
-// parse time so a bare local name can never reach the wire (MAIL FROM, the
-// From header, the Message-ID domain). EMAIL_DEFAULT_ACCOUNT is stored raw
-// and resolved at call time, so a stale default only fails the calls that
-// rely on it. EMAIL_READ_BODY_LIMIT is the single global knob for the
-// read-verb body budget.
+// dsh-email configuration: the EMAIL_* env contract (read once at plugin boot)
+// plus the optional config layer the cordis loader delivers to the constructor
+// (a patch entry targeting this plugin's id: the same fields, camelCase, as
+// explicit values). An account is declared by any EMAIL_<NAME>_<FIELD>
+// variable; the account is valid only when the four required fields (USER,
+// PASS, IMAP_HOST, SMTP_HOST) are all present and the effective FROM (the FROM
+// value, else USER) is a mailbox address (a local part and a domain around an
+// @), otherwise it is dropped with a warning (boot never fails). The FROM
+// shape is validated at parse time so a bare local name can never reach the
+// wire (MAIL FROM, the From header, the Message-ID domain).
+// EMAIL_DEFAULT_ACCOUNT is stored raw and resolved at call time, so a stale
+// default only fails the calls that rely on it. EMAIL_READ_BODY_LIMIT is the
+// single global knob for the read-verb body budget.
+// The delivered layer is folded onto a copy of the env record before parsing:
+// a delivered field is an explicit value (it beats the env value, which beats
+// the built-in default); fields the layer omits resolve as the env contract.
+// A config account missing a required field is dropped with a warning, the
+// same rule as env. Layer composition (which patch layer wins, no deep merge)
+// is cordis semantics: the plugin sees only the one object the loader delivers.
 import type { AccountConfig, EmailConfig, TlsEndpoint, TlsMode } from './types.js'
 
 /** Account name charset: lowercase start, 1-32 chars (same convention as dsh-timer job ids). */
@@ -192,6 +200,96 @@ export function parseEnv(env: Record<string, string | undefined>, warn: (msg: st
     accounts.push(acc.account)
   }
   return { accounts, readBodyLimit }
+}
+
+/**
+ * One account of the delivered config layer: the camelCase mirror of the
+ * per-account env fields. Every key is optional; a key absent here resolves
+ * as the env contract (see foldConfig).
+ */
+export interface DeliveredAccountConfig {
+  user?: string
+  pass?: string
+  imapHost?: string
+  imapPort?: number
+  imapSecure?: TlsMode
+  imapAllowInsecureTls?: boolean
+  smtpHost?: string
+  smtpPort?: number
+  smtpSecure?: TlsMode
+  smtpAllowInsecureTls?: boolean
+  from?: string
+  fromName?: string
+  sentFolder?: string
+  sentFolderAutocreate?: boolean
+  allowDelete?: boolean
+  timeoutMs?: number
+}
+
+/**
+ * The delivered config layer (validated by the plugin's static Config schema
+ * before it reaches the constructor). All keys optional; undefined or {} is
+ * exactly the env-only behavior.
+ */
+export interface DeliveredConfig {
+  defaultAccount?: string
+  readBodyLimit?: number
+  accounts?: Record<string, DeliveredAccountConfig>
+}
+
+/** camelCase config-layer key -> the env field suffix it maps onto. */
+const CONFIG_FIELD_TO_ENV: Record<string, string> = {
+  user: 'USER',
+  pass: 'PASS',
+  imapHost: 'IMAP_HOST',
+  imapPort: 'IMAP_PORT',
+  imapSecure: 'IMAP_SECURE',
+  imapAllowInsecureTls: 'IMAP_ALLOW_INSECURE_TLS',
+  smtpHost: 'SMTP_HOST',
+  smtpPort: 'SMTP_PORT',
+  smtpSecure: 'SMTP_SECURE',
+  smtpAllowInsecureTls: 'SMTP_ALLOW_INSECURE_TLS',
+  from: 'FROM',
+  fromName: 'FROM_NAME',
+  sentFolder: 'SENT_FOLDER',
+  sentFolderAutocreate: 'SENT_FOLDER_AUTOCREATE',
+  allowDelete: 'ALLOW_DELETE',
+  timeoutMs: 'TIMEOUT_MS',
+}
+
+/**
+ * Fold the delivered config layer into the env contract. The layer is
+ * materialized as synthetic EMAIL_* variables written over a copy of the env
+ * record (so a delivered value beats the env value, which beats the built-in
+ * default), and the merged record is parsed by the unchanged env parser, the
+ * single authority for validation and defaults. The input env record is not
+ * mutated.
+ * @param env the raw env record (process.env at boot, or a test fixture).
+ * @param config the delivered config layer (undefined or {} = env only).
+ * @param warn the drop-reporting hook (config accounts dropped by the
+ * required-field rule report through the same channel as env drops).
+ * @returns the validated account set (sorted by name), the raw default
+ * account name, and the read-body budget.
+ */
+export function foldConfig(
+  env: Record<string, string | undefined>,
+  config: DeliveredConfig | undefined,
+  warn: (msg: string) => void,
+): EmailConfig {
+  if (!config) return parseEnv(env, warn)
+  const merged: Record<string, string | undefined> = { ...env }
+  if (config.defaultAccount !== undefined) merged.EMAIL_DEFAULT_ACCOUNT = config.defaultAccount
+  if (config.readBodyLimit !== undefined) merged.EMAIL_READ_BODY_LIMIT = String(config.readBodyLimit)
+  for (const [name, fields] of Object.entries(config.accounts ?? {})) {
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined || value === null) continue
+      const suffix = CONFIG_FIELD_TO_ENV[key]
+      if (suffix === undefined) continue
+      merged[`EMAIL_${name.toUpperCase()}_${suffix}`] =
+        typeof value === 'boolean' || typeof value === 'number' ? String(value) : value
+    }
+  }
+  return parseEnv(merged, warn)
 }
 
 function buildAccount(e: RawAccount, valid: boolean): { account: AccountConfig } | { error: string } {

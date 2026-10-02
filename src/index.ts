@@ -1,6 +1,8 @@
 // dsh-email package entry (public surface).
 export { DshEmailPlugin } from './plugin.js'
 export { default } from './plugin.js'
+export { foldConfig } from './config.js'
+export type { DeliveredAccountConfig, DeliveredConfig } from './config.js'
 export type {
   AccountConfig,
   AddressView,

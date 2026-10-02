@@ -662,7 +662,7 @@ const OPS: Record<Verb, (cfg: EmailConfig, args: Args) => Promise<unknown>> = {
     return { account: acct.name, ...res }
   },
   // ---------------------------------------------------------------------
-  // mailbox management (v1.6): create_folder / delete_folder / move / delete
+  // mailbox management: create_folder / delete_folder / move / delete
   // ---------------------------------------------------------------------
 
   async create_folder(cfg, args) {

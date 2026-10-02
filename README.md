@@ -1,6 +1,6 @@
 # dsh-email
 
-Mail plugin for DSH. Reads and sends mail through configured IMAP/SMTP accounts: list and search mailboxes, read messages (without marking them seen), mark flags, save message parts to disk, send/reply/forward with attachments, and manage mailboxes (create/delete folders, move or delete messages - deletion is per-account gated). Accounts are declared in environment variables; the plugin keeps no state and pools no connections.
+Mail plugin for DSH. Reads and sends mail through configured IMAP/SMTP accounts: list and search mailboxes, read messages (without marking them seen), mark flags, save message parts to disk, send/reply/forward with attachments, and manage mailboxes (create/delete folders, move or delete messages - deletion is per-account gated). Accounts are declared in environment variables, optionally overridden by a config layer from a cordis patch file; the plugin keeps no state and pools no connections.
 
 ## Installation
 
@@ -10,11 +10,11 @@ dsh-email is an out-of-tree plugin for a dsh profile. Install it with the dsh pl
 dsh plugin --profile <name> add dsh-email
 ```
 
-Configuration is environment only (below); no files are created.
+Configuration is environment plus an optional config layer from a cordis patch file (both below); the plugin creates no files.
 
 ## Configuration
 
-All configuration is environment; changes take effect on a host restart. One account needs four variables, the rest are optional:
+The base configuration is environment; env changes take effect on a host restart. One account needs four variables, the rest are optional:
 
 | Variable | Required | Meaning |
 |---|---|---|
@@ -49,6 +49,25 @@ EMAIL_LOCAL_IMAP_HOST=mail.local.example
 EMAIL_LOCAL_SMTP_HOST=mail.local.example
 EMAIL_LOCAL_SENT_FOLDER=Sent
 ```
+
+### Config layer (cordis patch)
+
+An optional config layer sits on top of the env block: a patch entry targeting the plugin id `dsh-email` (the profile's `cordis.patch.yml`, the user-global `~/.dsh/cordis.patch.yml`, or a `--patch` overlay) carries a `config` object whose keys are camelCase mirrors of the env fields - `defaultAccount`, `readBodyLimit`, and `accounts` (a map of account name to `user`, `pass`, `imapHost`, `imapPort`, `imapSecure`, `imapAllowInsecureTls`, `smtpHost`, `smtpPort`, `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs`). Every key is optional.
+
+```yaml
+- id: dsh-email
+  config:
+    readBodyLimit: 500
+    accounts:
+      default:
+        imapPort: 1043
+```
+
+- One precedence chain: delivered value > env value > built-in default; keys the layer omits resolve as the env block, so `config: {}` (or no entry) is exactly the env-only behavior.
+- A patch targets a row by id and replaces its whole config - no deep merge, so a layer that overrides one field restates the fields it keeps (layer order: the plugin's own default entry, the profile patch, the user-global patch, any `--patch` overlay).
+- The layer is validated before the plugin starts: an unknown key or an out-of-range value fails the plugin entry at load; incomplete account data only warns, as in the env block.
+- With the live patch reload, editing the patch file re-runs the plugin without a restart; otherwise the change applies at the next restart.
+- The agent edits the patch file as a plain file operation under its own permissions; the plugin provides no tool for changing its own configuration. The `accounts` verb shows values only.
 
 ## Usage
 

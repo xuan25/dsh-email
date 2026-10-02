@@ -5,7 +5,10 @@
 // flag store, APPEND source identity, SMTP envelope and MIME shape, mailbox
 // create/delete, uid-scoped copy+expunge moves), the
 // STARTTLS branches, the closed error-code vocabulary, the tool error
-// surface, plugin/skill assembly, and the shipped-hygiene guards.
+// surface, the delivered config layer (schema validation plus fold semantics,
+// including a wire-level proof that a layer-carried value behaves exactly
+// like its env counterpart), plugin/skill assembly, and the shipped-hygiene
+// guards.
 // Run with: node --test test/   (or: node test/selftest.mjs)
 import { readdirSync, readFileSync, existsSync, statSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
 import os from 'node:os'
@@ -23,6 +26,7 @@ const {
   parseIntBounded,
   parseTlsMode,
   parseEnv,
+  foldConfig,
   resolveAccount,
   DEFAULT_IMAP_PORT,
   DEFAULT_SMTP_PORT,
@@ -1784,7 +1788,131 @@ async function withServer(start, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// 29. shipped hygiene guards
+// 29. the delivered config layer: schema validation + fold semantics
+// ---------------------------------------------------------------------------
+{
+  // -- the schema: accept matrix (the layer is a camelCase mirror of the env)
+  const validate = (x) => DshEmailPlugin.Config['~standard'].validate(x)
+  const issues = (x) => (validate(x).issues ?? []).map((i) => i.message)
+  const noIssues = (x) => validate(x).issues === undefined
+
+  ok('cfgschema: an empty layer passes', noIssues({}))
+  ok('cfgschema: absent layers pass (undefined and null, the env-only behavior)', noIssues(undefined) && noIssues(null))
+  ok('cfgschema: the full mirror passes', noIssues({
+    defaultAccount: 'default',
+    readBodyLimit: 500,
+    accounts: {
+      default: {
+        user: 'agent@example.com', pass: 'secret', imapHost: 'imap.example.com', imapPort: 994,
+        imapSecure: 'TLS', imapAllowInsecureTls: true, smtpHost: 'smtp.example.com', smtpPort: 465,
+        smtpSecure: 'none', smtpAllowInsecureTls: false, from: 'agent@example.com', fromName: 'Agent',
+        sentFolder: 'Sent', sentFolderAutocreate: false, allowDelete: true, timeoutMs: 5000,
+      },
+      'other-acct': { user: 'eve@example.com', pass: 'pw', imapHost: 'imap2.example.com', smtpHost: 'smtp2.example.com' },
+    },
+  }))
+  ok('cfgschema: a sparse layer passes', noIssues({ accounts: { default: { imapPort: 994 } } }))
+  ok('cfgschema: TLS mode words pass case-insensitively (the env contract normalizes case)', noIssues({ accounts: { a: { imapSecure: 'TLS', smtpSecure: 'StartTls' } } }))
+  const v = validate({ readBodyLimit: 500, defaultAccount: 'default', accounts: { default: { imapPort: 994 } } })
+  ok('cfgschema: the validated value keeps the carried fields verbatim', v.value.readBodyLimit === 500 && v.value.defaultAccount === 'default' && v.value.accounts.default.imapPort === 994 && Object.keys(v.value.accounts).join() === 'default', v.value)
+
+  // -- the schema: reject matrix (each violation fails the entry loudly)
+  ok('cfgschema: an unknown root key fails (typo guard)', issues({ bogus: 1 }).some((m) => m.includes('unknown key "bogus"') && m.includes('defaultAccount')))
+  ok('cfgschema: an unknown account key fails (the imapport typo)', issues({ accounts: { default: { imapport: 1 } } }).some((m) => m.includes('unknown key "imapport"')))
+  eq('cfgschema: port bounds are inclusive 1-65535', issues({ accounts: { default: { imapPort: 0 } } }).length + issues({ accounts: { default: { imapPort: 65536 } } }).length, 2)
+  ok('cfgschema: a fractional port fails (the integer step)', issues({ accounts: { default: { imapPort: 993.5 } } }).length === 1)
+  ok('cfgschema: a non-numeric port fails', issues({ accounts: { default: { imapPort: '993' } } }).length === 1)
+  ok('cfgschema: timeoutMs and readBodyLimit of 0 fail', issues({ accounts: { default: { timeoutMs: 0 } } }).length === 1 && issues({ readBodyLimit: 0 }).length === 1)
+  ok('cfgschema: an unknown TLS mode fails', issues({ accounts: { default: { imapSecure: 'auto' } } }).length === 1)
+  ok('cfgschema: a non-boolean switch fails', issues({ accounts: { default: { allowDelete: 'maybe' } } }).length === 1)
+  ok('cfgschema: an account name outside the charset fails', issues({ accounts: { 'Bad_Name': {} } }).length === 1 && issues({ accounts: { '9x': {} } }).length === 1)
+  ok('cfgschema: an account name over 32 characters fails', issues({ accounts: { ['a'.repeat(33)]: {} } }).length === 1)
+  ok('cfgschema: a non-object root fails', issues('nope').length === 1)
+  ok('cfgschema: a non-object accounts value fails', issues({ accounts: [1] }).length === 1)
+
+  // -- fold semantics: one precedence chain (config value, env value, default)
+  const envBase = {
+    ...envOne('default', { imapPort: 993, smtpPort: 1, imapInsecure: true, smtpInsecure: true }),
+    EMAIL_DEFAULT_TIMEOUT_MS: '123456',
+    EMAIL_DEFAULT_SMTP_SECURE: 'starttls',
+  }
+  const byName = (cfg) => Object.fromEntries(cfg.accounts.map((a) => [a.name, a]))
+
+  let f = foldConfig(envBase, { readBodyLimit: 500, accounts: { default: { imapPort: 994 } } }, () => {})
+  eq('fold: the config value beats the env value for the same field', byName(f).default.imap.port, 994)
+  eq('fold: the config value beats the env value at the top level', f.readBodyLimit, 500)
+  eq('fold: a field the layer omits keeps the env value', byName(f).default.smtp.port, 1)
+  eq('fold: a field in neither layer keeps the built-in default', byName(f).default.imap.tls, DEFAULT_IMAP_TLS)
+  eq('fold: the env timeout wins over the default', byName(f).default.timeoutMs, 123456)
+  eq('fold: the env TLS mode wins over the default', byName(f).default.smtp.tls, 'starttls')
+
+  f = foldConfig(envBase, { accounts: { default: { smtpPort: 465, smtpSecure: 'none', allowDelete: true } } }, () => {})
+  eq('fold: a sparse layer changes only the fields it carries', [byName(f).default.smtp.port, byName(f).default.smtp.tls, byName(f).default.allowDelete], [465, 'none', true])
+  eq('fold: a sparse layer keeps the untouched IMAP side', byName(f).default.imap.port, 993)
+
+  f = foldConfig(envBase, { accounts: { extra: { user: 'eve@example.com', pass: 'pw', imapHost: 'imap2.example.com', smtpHost: 'smtp2.example.com' } } }, () => {})
+  eq('fold: a config-only account joins the env accounts', f.accounts.map((a) => a.name), ['default', 'extra'])
+  eq('fold: the config-only account resolves its own defaults', [byName(f).extra.imap.port, byName(f).extra.smtp.port, byName(f).extra.from], [993, 587, 'eve@example.com'])
+
+  const dropWarns = []
+  f = foldConfig(envBase, { accounts: { partial: { user: 'eve@example.com', pass: 'pw', imapHost: 'imap2.example.com' } } }, (m) => dropWarns.push(m))
+  eq('fold: a config account missing a required field is dropped (the env rule)', f.accounts.map((a) => a.name), ['default'])
+  ok('fold: the drop reports through the boot warning channel', dropWarns.some((m) => m.includes('partial') && m.includes('SMTP_HOST')), dropWarns)
+
+  f = foldConfig({ ...envBase, ...envOne('side', { imapPort: 5, smtpPort: 5 }), EMAIL_DEFAULT_ACCOUNT: 'default' }, { defaultAccount: 'side' }, () => {})
+  eq('fold: the layer defaultAccount beats the env one (baked into isDefault)', [byName(f).side.isDefault, byName(f).default.isDefault], [true, false])
+
+  f = foldConfig(envBase, { accounts: { default: { from: 'boss@example.com', fromName: 'Boss', sentFolder: 'Archive', sentFolderAutocreate: false } } }, () => {})
+  eq('fold: string fields carry through to the parsed config', [byName(f).default.from, byName(f).default.fromName, byName(f).default.sentFolder, byName(f).default.sentFolderAutocreate], ['boss@example.com', 'Boss', 'Archive', false])
+
+  const envCopy = { ...envBase }
+  eq('fold: a layer of {} is exactly the env-only parse', JSON.stringify(parseEnv(envBase, () => {})), JSON.stringify(foldConfig(envCopy, {}, () => {})))
+  ok('fold: the input env record is not mutated', JSON.stringify(envCopy) === JSON.stringify(envBase))
+
+  // -- wire level: a layer-carried bound behaves exactly like its env
+  // counterpart (the two channels are the same expressiveness)
+  await withServer(
+    () => startImapServer({ mode: 'tls', users: { agent: 'secret' }, folders: { INBOX: { messages: boundaryMessages() } }, subscribed: ['INBOX'] }),
+    (srv) =>
+      (async () => {
+        const cfg = foldConfig(envOne('trunc', { imapPort: srv.port, smtpPort: 1 }), { readBodyLimit: 100 }, () => {})
+        eq('layer-limit: the folded config carries the global bound', cfg.readBodyLimit, 100)
+        const { ctx, state } = fakeCtx()
+        registerTool(ctx, cfg)
+        const execute = (args) => Promise.resolve(state.tools[0].execute(args))
+        let r = doc(await execute({ verb: 'read', uid: 1 }))
+        eq('layer-limit: a 99-char body is not truncated', [r.body.truncated, r.body.totalLength, r.body.text.length], [false, 99, 99])
+        r = doc(await execute({ verb: 'read', uid: 3 }))
+        eq('layer-limit: a 101-char body truncates at the layer bound', [r.body.truncated, r.body.totalLength, r.body.text.length], [true, 101, 100])
+      })(),
+  )
+
+  // -- assembly: the constructor folds the delivered layer (real env scrubbed)
+  {
+    const savedEnv = {}
+    for (const k of Object.keys(process.env)) if (k.startsWith('EMAIL_')) { savedEnv[k] = process.env[k]; delete process.env[k] }
+    try {
+      // The real deployment declares all-caps EMAIL_DEFAULT_* variables; the
+      // config layer synthesizes the same casing, so the two layers write the
+      // very same variables (no case-variant conflict at the parser).
+      const upper = {}
+      for (const [k, val] of Object.entries(envOne('default', { imapPort: 993, smtpPort: 1 }))) upper[k.toUpperCase()] = val
+      Object.assign(process.env, { ...upper, EMAIL_DEFAULT_ACCOUNT: 'default' })
+      const { ctx, state } = fakeCtx()
+      new DshEmailPlugin(ctx, { readBodyLimit: 500, accounts: { default: { imapPort: 1234 } } })
+      ok('assembly: a valid layer produces no boot warnings', state.warns.length === 0, state.warns)
+      const out = doc(await state.tools[0].execute({ verb: 'accounts' }))
+      eq('assembly: the folded layer is visible in the accounts verb', [out.default, out.accounts[0].imap.port, out.accounts[0].smtp.port], ['default', 1234, 1])
+      ok('assembly: the accounts presentation keeps its shape (no source annotations)', out.accounts.every((a) => Object.keys(a).every((k) => ['name', 'user', 'from', 'imap', 'smtp', 'sentFolder', 'sentFolderAutocreate', 'allowDelete', 'isDefault'].includes(k))), out.accounts)
+    } finally {
+      for (const k of Object.keys(process.env)) if (k.startsWith('EMAIL_')) delete process.env[k]
+      Object.assign(process.env, savedEnv)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 30. shipped hygiene guards
 // ---------------------------------------------------------------------------
 {
   for (const f of readdirSync(path.join(PKG, 'src'))) {
@@ -1819,7 +1947,7 @@ async function withServer(start, fn) {
   eq('manifest: entry', manifest.main, './lib/index.js')
   ok('manifest: exports point at entry + types', manifest.exports['.'].default === './lib/index.js' && manifest.exports['.'].types === './lib/index.d.ts')
   eq('manifest: runtime dependencies are the two protocol libraries', Object.keys(manifest.dependencies ?? {}).sort(), ['imapflow', 'nodemailer'])
-  ok('manifest: peer set', ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-skill', '@deepseek-ai/dsh-system-prompt', 'yaml'].every((p) => p in manifest.peerDependencies))
+  ok('manifest: peer set', ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-skill', '@deepseek-ai/dsh-system-prompt', '@deepseek-ai/schemastery', 'yaml'].every((p) => p in manifest.peerDependencies))
   eq('manifest: bundle patch pointer', manifest.dsh.bundle.patch, './cordis.patch.yml')
   ok('manifest: bundle patch file present', existsSync(path.join(PKG, 'cordis.patch.yml')))
   ok('manifest: files entries present', manifest.files.every((f) => existsSync(path.join(PKG, f.replace(/\/$/, '')))))
