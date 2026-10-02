@@ -1,0 +1,7 @@
+# dsh-email: cordis bundle patch that registers the plugin in the profile.
+# Configuration is env-only (the EMAIL_* variables, see README); there are no
+# profile config fields, so config is empty.
+- insert:
+    - id: dsh-email
+      name: 'dsh-email'
+      config: {}

@@ -1,0 +1,3 @@
+autoInstallPeers: false
+minimumReleaseAgeExclude:
+  - imapflow@2.2.1

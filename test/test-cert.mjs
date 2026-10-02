@@ -1,0 +1,57 @@
+// Self-signed certificate and key for the fake IMAP/SMTP servers in the
+// selftest (CN=localhost, generated 2026-10-01, valid through 2036-09-28).
+// The certificate is a fixed test vector: it is trusted by no system store,
+// so a client that validates strictly must reject it (code tls) and a
+// client that explicitly downgrades (accepts self-signed certificates) must
+// accept it. The key pair matches the certificate.
+
+export const CERT_PEM = `-----BEGIN CERTIFICATE-----
+MIIDCTCCAfGgAwIBAgIUKJWsNH6gBpbzU/QTFIVXytavrmkwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTAwMTE0MTYwMVoXDTM2MDky
+ODE0MTYwMVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAwWJ95x3shQz4qwVifWKC/ygstlsptw8na1myibpYzOWm
+zqPmBKr3ncEVqNKCXuQVibwO7h+XXEMTUpF1G1poeBtg83Sh9y3QxMMWt0QNcHqE
+jdVcaetbDksKt/+zU57BaNCCnmye79+PqoHldx8p7jQgGu/oviJPvCfstiYRjLB2
+EslP0lCRA6g3o31m5AIZdGAFwkvLIJfzLvaFIIacKN545LgmEaJW7k7VHuXenXui
+4JV+r1xboZ6wf6wxtXq/oCLbln8CmIeZJmIdDdRiUdxl8dspR5+ntJjpLm7nsX1i
+QKXMoOuaHmfd9xhOzKHL8IutJ987sE/2bkmw647HJwIDAQABo1MwUTAdBgNVHQ4E
+FgQU9oGfKfkdcsye+ZHQSCR8CQgyrP4wHwYDVR0jBBgwFoAU9oGfKfkdcsye+ZHQ
+SCR8CQgyrP4wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAUI7D
+7sC+na9nLFxETVXyC32SggW1Hk9Eb5t0vJt7o40zCR21KQevUaHJvajiMfRFk5kR
+ZqdBa1zUc/uFxy72V/wUJQaAO58gxC/5bdq2OYiStwHh71y7korc2muwWusNPbsr
+kQ36xajIadad9JKRtkMOA6/pXK383SQCzJqxVf0UmElEHbKhRLFoaQEG1GAPNKPg
+YfwNZoVDe4IOq5tNVkvPW+N7AJ+D8dYApTNZxoGQ/4A1mjhte9geva8Op26NXpF0
+JsMfBu84SOwVjVQrqUnfdWqW0/6Axqg9uQq7Ubatlr73/W4vTZYPyrpYMcJU6hWB
+IrwNIVQqa8l//PBWwA==
+-----END CERTIFICATE-----
+`
+
+export const KEY_PEM = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDBYn3nHeyFDPir
+BWJ9YoL/KCy2Wym3DydrWbKJuljM5abOo+YEqvedwRWo0oJe5BWJvA7uH5dcQxNS
+kXUbWmh4G2DzdKH3LdDEwxa3RA1weoSN1Vxp61sOSwq3/7NTnsFo0IKebJ7v34+q
+geV3HynuNCAa7+i+Ik+8J+y2JhGMsHYSyU/SUJEDqDejfWbkAhl0YAXCS8sgl/Mu
+9oUghpwo3njkuCYRolbuTtUe5d6de6LglX6vXFuhnrB/rDG1er+gItuWfwKYh5km
+Yh0N1GJR3GXx2ylHn6e0mOkubuexfWJApcyg65oeZ933GE7Mocvwi60n3zuwT/Zu
+SbDrjscnAgMBAAECggEAODRvgkYUsYDZHx+UBfwlNZKQGDn7sEwzuUQbG2NxHrAa
+YJGLL00fZZayPFxebsTcq6jgL/43iCWojoVfI2GN3maasXdzAXur4xwOVJpvS4MY
+Vn6t+szgLJHL3jlvfby02slLRU8tjGsN/tD9B7ejgKter2WN4ADp6rYx2qjKzfgU
+G8ml7tTNVnL+XgOGxOk0YFc5AEmORwd9qQMNEO6Sthsr20ef3ooR+44Fv9Ffnlun
+txe1a71X/6mJrb6HJZ7nNc06xSzbzXq73Ay7gLyI1lx8vzj489D+mc88SpNVi2k6
+58ImRsWBHks+kYw9S3AlfVnf/IEqqLyXBXKEuGuSIQKBgQDlXr2582OVg5HTndsb
+WfLakB5MMVfDZBZGKcXJbhHApsKNtf7BPY+TJvnmR6IxCQuP/2KZcrhr1B0iArNB
+PySXb31UHT37BJ2IKy2u3mA4UaI2K1tj8gfiP009parPMcnMOrT50IYQ+mqP/8qo
+fMb1+mOzba4GwpeIRHCisMMsxwKBgQDX1jTdGoCgTlWkaBjyciE88uzdxg+bwDgY
+d4yYWZNIrEP1Cp4fNpp2V4fF0THL/5QV4VWQYHtFQu59mM+PCjCzpfdFVF2w3VLV
+fdyBMmBhF9t5D7RMjtCR+oQR7GAgcgJTxT1KVnib0XuOSwYw202fLgdFb9phsS0d
+GV6q/SlyoQKBgQCpyd0GBl4kMlXDYWntMENueRqEak4+LBu06n0n45uukYMZJayk
+XS6nzkVUqpgsVjbB7FmPn3VXFJhQMdGBrf0nQHd0yYS1CTCXuObDOIffiMZb9PJc
+5K/jUdqalMUBRSjNTnPjLPHhJY22dLIO0Pby5Nvi2YDmLiu/ynHabKC9xwKBgGGv
+K/vJy99BtNcU2f2Yk9x+4Z85zcSjCYBhUvt8xwEEHjmgFZJw5xWaZfOsy0nVoVMJ
+yezvDbt6IHAtofrOFN6pxbDWDxVGBgBj11GN2Dr5TjaLWgGwPUtkQzPNdHAayVza
+jvO/ERUMiUwMPoAMMSRS862EgyTlyFI8MjFXJNQhAoGAD8BELax84JRMaJThaEKn
+eX4sdxrCImI15qTzBxvApqVnbQpdUJGrPJMz3bzSxah0hsSuyB+4rUuEFvBPW7U8
+zYMBA1iqXVHOyTnLjQ1ONLwWfws8pMWZylsCdI//BZE5bfI2qjjhQfk/0QALve2o
+7ptsYZLtslFqYF6DJ9sLmdE=
+-----END PRIVATE KEY-----
+`
