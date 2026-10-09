@@ -4,9 +4,9 @@
 // Pure type surface plus one small value (the error-code set); safe to import
 // from every module and from the selftest.
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Logger } from '@deepseek-ai/cordis'
 
-export type { Context }
+export type { Context, Logger }
 
 /**
  * The TLS mode of one endpoint (an explicit mode setting, not a switch):
@@ -29,6 +29,36 @@ export interface TlsEndpoint {
   port: number
   tls: TlsMode
   allowInsecure: boolean
+}
+
+/**
+ * The trigger watcher settings of one account, as parsed from the seven
+ * TRIGGER_* fields (see parseTriggerFields in config.ts). `off` accounts
+ * open no watcher connection and keep exactly the verb-only footprint.
+ * `malformed` accounts (a type/range violation in any of the seven fields,
+ * or an enable without a prompt) start no watcher either: the watcher
+ * constructor entry is the single validation point and reports a warning;
+ * the account itself stays fully usable through every email verb.
+ */
+export type TriggerState =
+  | { kind: 'off' }
+  | { kind: 'on'; config: TriggerConfig }
+  | { kind: 'malformed'; reason: string }
+
+/** The valid trigger watcher settings of one account (all defaults filled in). */
+export interface TriggerConfig {
+  /** The policy prompt, verbatim (the only free-form content of the prompt). */
+  prompt: string
+  /** The listened folder (single folder per account; default INBOX). */
+  folder: string
+  /** Heartbeat resync period in ms (floor 1000, validated not clamped). */
+  idleMs: number
+  /** Max concurrent trigger sessions (1 = strictly serial). */
+  maxConcurrent: number
+  /** Max queued (waiting) uids; overflow is logged, mail stays UNSEEN. */
+  queueMax: number
+  /** Named agent preset; absent = deployment default. */
+  preset?: string
 }
 
 /** One configured mail account (IMAP + SMTP endpoint pair, shared credentials). */
@@ -67,6 +97,14 @@ export interface AccountConfig {
   timeoutMs: number
   /** True when EMAIL_DEFAULT_ACCOUNT points at this account. */
   isDefault: boolean
+  /**
+   * The new-mail trigger watcher state of this account (v1.9). 'on' = a
+   * resident IMAP connection listens on triggerFolder and dispatches one
+   * fresh agent session per new UNSEEN message; 'off' = no watcher (the
+   * default, zero-connection footprint); 'malformed' = the seven trigger
+   * fields did not validate, no watcher starts, the account is unaffected.
+   */
+  trigger: TriggerState
 }
 
 /** The parsed EMAIL_* contract (read once at plugin boot). */

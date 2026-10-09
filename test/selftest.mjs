@@ -48,6 +48,8 @@ const { RAW_HEADERS_LIMIT, RAW_HEADERS_TRUNCATED, presentRawHeaders, quoteText }
 )
 const { DEFAULT_SAVE_DIR, sanitizeFilename } = await import(path.join(PKG, 'lib', 'save.js'))
 const { DshEmailPlugin } = await import(path.join(PKG, 'lib', 'index.js'))
+const { MailWatcher } = await import(path.join(PKG, 'lib', 'watch.js'))
+const { buildWatcherConnection } = await import(path.join(PKG, 'lib', 'imap-client.js'))
 const { startImapServer, makeMessage } = await import(path.join(PKG, 'test', 'fake-imap.mjs'))
 const { startSmtpServer } = await import(path.join(PKG, 'test', 'fake-smtp.mjs'))
 
@@ -361,6 +363,7 @@ function envOne(name, o = {}) {
     sentFolderAutocreate,
     allowDelete,
     timeout,
+    trigger,
   } = o
   const env = {
     [`EMAIL_${name}_USER`]: 'agent',
@@ -380,18 +383,47 @@ function envOne(name, o = {}) {
   if (sentFolderAutocreate !== undefined) env[`EMAIL_${name}_SENT_FOLDER_AUTOCREATE`] = String(sentFolderAutocreate)
   if (allowDelete !== undefined) env[`EMAIL_${name}_ALLOW_DELETE`] = String(allowDelete)
   if (timeout) env[`EMAIL_${name}_TIMEOUT_MS`] = String(timeout)
+  if (trigger) {
+    if (trigger.enable !== undefined) env[`EMAIL_${name}_TRIGGER_ENABLE`] = String(trigger.enable)
+    if (trigger.prompt !== undefined) env[`EMAIL_${name}_TRIGGER_PROMPT`] = trigger.prompt
+    if (trigger.folder) env[`EMAIL_${name}_TRIGGER_FOLDER`] = trigger.folder
+    if (trigger.idleMs) env[`EMAIL_${name}_TRIGGER_IDLE_MS`] = String(trigger.idleMs)
+    if (trigger.maxConcurrent) env[`EMAIL_${name}_TRIGGER_MAX_CONCURRENT`] = String(trigger.maxConcurrent)
+    if (trigger.queueMax) env[`EMAIL_${name}_TRIGGER_QUEUE_MAX`] = String(trigger.queueMax)
+    if (trigger.preset) env[`EMAIL_${name}_TRIGGER_PRESET`] = trigger.preset
+  }
   return env
 }
 
-/** A minimal cordis Context double collecting every registration. */
-function fakeCtx() {
-  const state = { tools: [], providers: [], sections: [], provided: [], warns: [] }
+/** A minimal cordis Context double collecting every registration.
+ *
+ * `services` is the map behind ctx.get: a key present in the map is a
+ * provided service (its value may be anything, including a function), an
+ * absent key reads as undefined (strict reads throw, like the real context).
+ * ctx.effect runs the execute callback immediately and keeps the returned
+ * disposer in state.effects so a test can dispose registered effects. */
+function fakeCtx(services = {}) {
+  const state = { tools: [], providers: [], sections: [], provided: [], warns: [], errors: [], infos: [], effects: [] }
   const ctx = {
     reflect: { provide: (name) => { state.provided.push(name) } },
-    logger: () => ({ warn: (m) => state.warns.push(m), error() {}, info() {}, debug() {} }),
+    logger: () => ({
+      warn: (m) => state.warns.push(m),
+      error: (m) => state.errors.push(m),
+      info: (m) => state.infos.push(m),
+      debug() {},
+    }),
     tools: { register: (t) => { state.tools.push(t); return () => {} } },
     skills: { registerProvider: (p) => { state.providers.push(p); return () => {} } },
     systemPrompt: { section: (s) => { state.sections.push(s); return () => {} } },
+    get: (name, strict) => {
+      const value = Object.prototype.hasOwnProperty.call(services, name) ? services[name] : undefined
+      if (value === undefined && strict) throw new Error(`service "${name}" is missing`)
+      return value
+    },
+    effect: (execute, label) => {
+      const disposer = execute()
+      state.effects.push({ label: label ?? null, dispose: () => { if (typeof disposer === 'function') disposer() } })
+    },
   }
   return { ctx, state }
 }
@@ -424,6 +456,169 @@ const imapCmd = (srvState, verb) => srvState.commands.filter((c) => c.startsWith
 
 /** The last SMTP connection record of one server instance. */
 const lastConn = (srvState) => srvState.connections.at(-1)
+
+// Trigger test helpers (section 31) -------------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** Poll check() until truthy or the timeout expires; resolves to the outcome. */
+async function waitFor(check, timeoutMs = 10000, stepMs = 50) {
+  const t0 = Date.now()
+  for (;;) {
+    if (await check()) return true
+    if (Date.now() - t0 >= timeoutMs) return false
+    await sleep(stepMs)
+  }
+}
+
+/** One trigger mailbox message (unseen unless listed in flags). */
+function tm(uid, subject, from) {
+  return makeMessage({
+    uid,
+    flags: [],
+    internalDate: `2026-10-0${Math.min(uid, 9)}T10:00:00Z`,
+    from: { address: `${from ?? 'sender'}@example.com` },
+    to: [{ address: 'agent@example.com' }],
+    subject,
+    rawHeaders: `From: ${from ?? 'sender'}@example.com\r\nSubject: ${subject}\r\n\r\n`,
+  })
+}
+
+/** A controllable session factory for the watcher createSession seam: each
+ *  call suspends until the test settles it, recording DispatchParams. */
+function makeSessionStub() {
+  const calls = []
+  const fn = (p) => {
+    const rec = { params: p, settled: false, resolve: null }
+    rec.promise = new Promise((resolve) => { rec.resolve = resolve })
+    calls.push(rec)
+    return rec.promise
+  }
+  return {
+    calls,
+    fn,
+    /** Settle the oldest unsettled call (FIFO) with the dispatch result. */
+    settleNext(result = { ok: true }) {
+      for (const rec of calls) {
+        if (!rec.settled) {
+          rec.settled = true
+          rec.resolve(result)
+          return true
+        }
+      }
+      return false
+    },
+    uids: () => calls.map((c) => c.params.uid),
+  }
+}
+
+/** A fake agents service: create() records its options; the returned agent
+ *  pushes the turn/end event (string reason, or a reason object with an
+ *  error message) after the followup the dispatcher sends. */
+function makeAgentsService(spec = {}) {
+  const creates = []
+  return {
+    creates,
+    create: async (options) => {
+      creates.push(options)
+      if (spec.createReject) throw new Error(spec.createReject)
+      const events = []
+      const agent = {
+        followup: (msg) => {
+          if (spec.followupReject) return Promise.reject(new Error(spec.followupReject))
+          events.push(msg)
+          if (spec.turnEnd !== undefined) events.push({ type: 'turn/end', data: { reason: spec.turnEnd } })
+          return Promise.resolve()
+        },
+        whenIdle: () => sleep(0),
+        cancel: () => {},
+        session: { snapshotEvents: () => events },
+      }
+      // The runtime invokes the create options' setup hook (the preset's
+      // mount into the unpublished agent scope) as part of the create.
+      if (typeof options.setup === 'function') {
+        await options.setup({}, agent)
+      }
+      return { agent, dispose: async () => {} }
+    },
+  }
+}
+
+/** A fake agentPresets service (the dispatcher's preset resolution seam).
+ *
+ * `resolveMountable: true` exposes the mountable-resolution face (the
+ * dispatcher prefers it over resolve for a named preset); `mounted` and
+ * `resolveCalls` are observation faces for the assertions. */
+function makePresetsService(spec = {}) {
+  const named = spec.named ?? {}
+  const mounted = []
+  const resolveCalls = { resolve: 0, resolveMountable: 0 }
+  const resolveImpl = async (id) => {
+    if (id === null || id === undefined) return { id: spec.defaultId ?? 'deployment-baseline' }
+    if (!(id in named)) throw new Error(`preset "${id}" is not available`)
+    return { id: named[id] }
+  }
+  const svc = {
+    resolve: async (id) => {
+      resolveCalls.resolve += 1
+      return resolveImpl(id)
+    },
+    mount: async (_agentCtx, id) => {
+      if (spec.mountReject) throw new Error(spec.mountReject)
+      mounted.push(id)
+    },
+    mounted,
+    resolveCalls,
+  }
+  if (spec.resolveMountable) {
+    svc.resolveMountable = async (id) => {
+      resolveCalls.resolveMountable += 1
+      return resolveImpl(id)
+    }
+  }
+  return svc
+}
+
+/** Build a MailWatcher from a fake server + env trigger fixture and start it.
+ *
+ * `autoIdleDelay` (ms) overrides the client auto-idle delay through the
+ * createConnection seam (test-only: speeds up the IDLE-poll branch on
+ * servers without the IDLE capability). `services` seeds ctx.get,
+ * `createSession` overrides the session factory (default: the production
+ * dispatcher, which then consumes the services). */
+function startTriggerWatcher(srv, { name = 'main', trigger, timeout, services = {}, createSession, autoIdleDelay } = {}) {
+  const env = envOne(name, { imapPort: srv.port, smtpPort: 1, timeout, trigger })
+  const cfg = parseEnv(env, () => {})
+  const acct = cfg.accounts[0]
+  const { ctx, state } = fakeCtx(services)
+  const opts = { ctx, account: acct, trigger: acct.trigger.config }
+  if (autoIdleDelay !== undefined) {
+    const extra = { autoIdleDelay }
+    opts.createConnection = (a) => buildWatcherConnection(a, extra).client
+  }
+  if (createSession) opts.createSession = createSession
+  const watcher = new MailWatcher(opts)
+  watcher.start()
+  return { watcher, state, ctx, acct }
+}
+
+/** Swap process.env to the trigger fixture env for a plugin-constructor
+ *  test; restores the previous env on exit. */
+async function withTriggerEnv(env, fn) {
+  const prev = { ...process.env }
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith('EMAIL_') && !(k in env)) delete process.env[k]
+  }
+  Object.assign(process.env, env)
+  try {
+    await fn()
+  } finally {
+    for (const k of Object.keys(process.env)) {
+      if (k.startsWith('EMAIL_') && !(k in prev)) delete process.env[k]
+    }
+    Object.assign(process.env, prev)
+  }
+}
 
 /** Run fn with a server handle, always stopping the server afterwards. */
 async function withServer(start, fn) {
@@ -2147,7 +2342,7 @@ async function withServer(start, fn) {
   eq('manifest: entry', manifest.main, './lib/index.js')
   ok('manifest: exports point at entry + types', manifest.exports['.'].default === './lib/index.js' && manifest.exports['.'].types === './lib/index.d.ts')
   eq('manifest: runtime dependencies are the two protocol libraries', Object.keys(manifest.dependencies ?? {}).sort(), ['imapflow', 'nodemailer'])
-  ok('manifest: peer set', ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-skill', '@deepseek-ai/dsh-system-prompt', '@deepseek-ai/schemastery', 'yaml'].every((p) => p in manifest.peerDependencies))
+  ok('manifest: peer set', ['@deepseek-ai/cordis', '@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-skill', '@deepseek-ai/dsh-system-prompt', '@deepseek-ai/schemastery', 'yaml'].every((p) => p in manifest.peerDependencies))
   eq('manifest: bundle patch pointer', manifest.dsh.bundle.patch, './cordis.patch.yml')
   ok('manifest: bundle patch file present', existsSync(path.join(PKG, 'cordis.patch.yml')))
   ok('manifest: files entries present', manifest.files.every((f) => existsSync(path.join(PKG, f.replace(/\/$/, '')))))
@@ -2155,18 +2350,641 @@ async function withServer(start, fn) {
   ok('manifest: patch registers the plugin id', patch.includes('id: dsh-email') && patch.includes("name: 'dsh-email'"))
   ok('manifest: compiled entry present', existsSync(path.join(PKG, 'lib', 'index.js')))
 }
+// ---------------------------------------------------------------------------
+// 31. new-mail trigger: watcher lifecycle, dispatch state, prompt shape,
+//     failure self-healing, and plugin integration (W1-W19)
+// ---------------------------------------------------------------------------
+{
+
+  /** Section-31 convenience: run a trigger case against a fresh fake IMAP
+   *  server (body first, server options second), always stopping the server. */
+  async function tServer(fn, opts = {}) {
+    const srv = await startImapServer(opts)
+    try {
+      await fn(srv)
+    } finally {
+      await srv.stop()
+    }
+  }
+
+  const AGENTS = { agents: makeAgentsService({}) }
+
+  // -- W1: boot resync dispatches every UNSEEN message, FIFO, no duplicates
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'), tm(2, 'B', 'b'), tm(3, 'C', 'c'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    const got1 = await waitFor(() => stub.calls.length >= 1)
+    ok('W1: boot resync dispatches the first unseen mail', got1 && stub.uids()[0] === 1)
+    eq('W1: concurrency 1 holds one in-flight slot, the other two sit in the queue', stub.calls.length, 1)
+    stub.settleNext()
+    ok('W1: settling frees the slot, next queued uid dispatched', await waitFor(() => stub.calls.length >= 2) && stub.uids()[1] === 2)
+    stub.settleNext()
+    ok('W1: chain continues to the last unseen uid', await waitFor(() => stub.calls.length >= 3) && stub.uids()[2] === 3)
+    stub.settleNext()
+    ok('W1: all three settles are logged', await waitFor(() => state.infos.filter((m) => m.includes('settled')).length >= 3, 2000))
+    eq('W1: FIFO order over all three uids', stub.uids(), [1, 2, 3])
+    eq('W1: three settle infos, zero warnings', [state.infos.filter((m) => m.includes('settled')).length, state.warns.length], [3, 0])
+    eq('W1: active + queue accounted for all three uids exactly once', stub.calls.length, 3)
+    const subjects = ['A', 'B', 'C']
+    for (let i = 0; i < stub.calls.length; i++) {
+      const uid = i + 1
+      ok(
+        `W1: the dispatch of uid ${uid} carries its own envelope line`,
+        stub.calls[i].params.prompt.includes(`uid ${uid} |`) && stub.calls[i].params.prompt.includes(`Subject: ${subjects[i]}`),
+      )
+    }
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W2: server without the IDLE capability: the library's auto-IDLE falls
+  //        back to the NOOP polling branch (missingIdleCommand default NOOP),
+  //        which the fake answers with a plain tag OK: no errors, no backoff,
+  //        no IDLE on the wire, and the EXISTS event still dispatches.
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+      autoIdleDelay: 200,
+    })
+    await sleep(1200)
+    ok('W2: the NOOP polling fallback runs against a NOIDLE server', srv.state.commands.filter((c) => c === 'NOOP').length >= 1)
+    eq('W2: the IDLE command was never sent (capability gated)', srv.state.commands.filter((c) => c === 'IDLE').length, 0)
+    eq('W2: no errors, no backoff warnings during the poll branch', [state.warns.length, state.errors.length], [0, 0])
+    srv.pushExists('INBOX', 1)
+    ok('W2: an EXISTS event still dispatches on the polling branch', await waitFor(() => stub.calls.length >= 1) && stub.uids()[0] === 1)
+    eq('W2: the dispatch caused no failures', state.warns.length, 0)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W3: concurrency 1 and 3 over 10 unseen mails: slot refill is FIFO
+  {
+    const srv = await startImapServer({ folders: { INBOX: { messages: [] } } })
+    try {
+      for (let i = 1; i <= 10; i++) srv.state.folders.INBOX.messages.push(tm(i, `S${i}`, 'a'))
+      const stub = makeSessionStub()
+      const { watcher, state } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', maxConcurrent: 1 },
+        createSession: stub.fn,
+      })
+      ok('W3a: the first mail takes the single slot', await waitFor(() => stub.calls.length >= 1))
+      eq('W3a: no second session starts before the first settles (active = 1, queue = 9)', stub.calls.length, 1)
+      for (let i = 2; i <= 10; i++) {
+        stub.settleNext()
+        const got = await waitFor(() => stub.calls.length >= i)
+        if (!got || stub.uids()[i - 1] !== i) break
+      }
+      eq('W3a: concurrency 1 drains all ten uids strictly in FIFO order', stub.uids(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+      eq('W3a: no failures along the way', state.warns.length, 0)
+      watcher.dispose()
+    } finally {
+      await srv.stop()
+    }
+  }
+  {
+    const srv = await startImapServer({ folders: { INBOX: { messages: [] } } })
+    try {
+      for (let i = 1; i <= 10; i++) srv.state.folders.INBOX.messages.push(tm(i, `S${i}`, 'a'))
+      const stub = makeSessionStub()
+      const { watcher, state } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', maxConcurrent: 3 },
+        createSession: stub.fn,
+      })
+      ok('W3b: three concurrent slots fill at boot', await waitFor(() => stub.calls.length >= 3) && stub.uids().slice(0, 3).join(',') === '1,2,3')
+      eq('W3b: the remaining seven uids sit in the queue without any overflow (active = 3, queue = 7)', state.warns.length, 0)
+      for (let i = 4; i <= 10; i++) {
+        stub.settleNext()
+        const got = await waitFor(() => stub.calls.length >= i)
+        if (!got) break
+      }
+      eq('W3b: concurrency 3 refills the freed slots in FIFO order', stub.uids(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+      eq('W3b: no failures along the way', state.warns.length, 0)
+      watcher.dispose()
+    } finally {
+      await srv.stop()
+    }
+  }
+
+  // -- W4: queue overflow is visible (log) and never dropped silently: the
+  //        mail stays UNSEEN and is picked up by a later resync
+  await tServer(async (srv) => {
+    for (let i = 1; i <= 8; i++) srv.state.folders.INBOX.messages.push(tm(i, `S${i}`, 'a'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', maxConcurrent: 1, queueMax: 5, idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W4: the first mail takes the single slot', await waitFor(() => stub.calls.length >= 1))
+    const overflow = state.warns.filter((m) => m.includes('queue full'))
+    eq('W4: one overflow log per resync names both overflowed uids with the overflow count', overflow.length, 1)
+    ok(
+      'W4: the overflow log carries the folder, the uid list and the count fields',
+      overflow[0].includes('folder "INBOX"') && overflow[0].includes('2 uid(s) overflowed') && overflow[0].includes('uid 7, 8'),
+    )
+    for (let i = 1; i <= 6; i++) {
+      stub.settleNext()
+      if (i < 6) await waitFor(() => stub.calls.length >= i + 1)
+    }
+    eq('W4: slot + queue drained in FIFO order, overflow never dispatched', stub.uids(), [1, 2, 3, 4, 5, 6])
+    await sleep(150)
+    eq('W4: no further dispatch after the queue drained', stub.calls.length, 6)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W5: duplicate EXISTS events do not re-dispatch an in-flight uid
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 1000 },
+      createSession: stub.fn,
+    })
+    srv.pushExists('INBOX', 1)
+    ok('W5: the first EXISTS dispatches', await waitFor(() => stub.calls.length >= 1))
+    srv.pushExists('INBOX', 1)
+    await sleep(250)
+    eq('W5: a duplicate EXISTS event does not re-dispatch the in-flight uid', stub.calls.length, 1)
+    stub.settleNext()
+    const msg = srv.state.folders.INBOX.messages[0]
+    msg.flags.add('\\Seen')
+    await sleep(1400)
+    eq('W5: after a marked settle the heartbeat resync dispatches nothing', stub.calls.length, 1)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W6: a settle that never marked the mail is replayed by the next
+  //        heartbeat resync (by design: UNSEEN is the only durable state)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 1000 },
+      createSession: stub.fn,
+    })
+    ok('W6: boot resync dispatches the unseen mail', await waitFor(() => stub.calls.length >= 1))
+    stub.settleNext()
+    ok('W6: the unmarked mail is replayed by the heartbeat resync', await waitFor(() => stub.calls.length >= 2, 4000))
+    eq('W6: the replay carries the same uid', stub.uids(), [1, 1])
+    stub.settleNext()
+    const msg = srv.state.folders.INBOX.messages[0]
+    msg.flags.add('\\Seen')
+    const n = stub.calls.length
+    await sleep(1400)
+    eq('W6: after the mail is finally marked, the resync goes quiet', stub.calls.length, n)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W7: silence after mark: a settle that marked the mail leaves later
+  //        heartbeat resyncs dispatching nothing (dedicated W7 row)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'M', 'mark@example.com'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 1000 },
+      createSession: stub.fn,
+    })
+    ok('W7: the unseen mail is dispatched', await waitFor(() => stub.calls.length >= 1))
+    stub.settleNext()
+    srv.state.folders.INBOX.messages[0].flags.add('\\Seen')
+    const n = stub.calls.length
+    await sleep(1500)
+    eq('W7: the marked settle is followed by quiet resyncs (no re-dispatch)', stub.calls.length, n)
+    eq('W7: the quiet resyncs produced no warnings', state.warns.length, 0)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W8: a forced connection drop heals through the backoff: a fresh IMAP
+  //        connection boots a fresh resync and picks up mail that arrived
+  //        while the transport was down
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W8: boot dispatch happens before the drop', await waitFor(() => stub.calls.length >= 1))
+    stub.settleNext()
+    srv.state.folders.INBOX.messages[0].flags.add('\\Seen')
+    srv.state.folders.INBOX.messages.push(tm(2, 'B', 'b'))
+    const connsBefore = srv.state.connections.length
+    srv.dropConnections()
+    ok('W8: the spontaneous close is routed to the backoff', await waitFor(() => state.warns.some((m) => m.includes('connection closed unexpectedly')), 4000))
+    ok('W8: a fresh connection is established after the backoff', await waitFor(() => srv.state.connections.length >= connsBefore + 1, 12000))
+    ok('W8: the resync on the fresh connection dispatches the mail that arrived while down', await waitFor(() => stub.calls.length >= 2, 6000) && stub.uids()[1] === 2)
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W9: zero trigger-enabled accounts: the plugin opens zero connections
+  await tServer(async (srv) => {
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1 }), async () => {
+      const { ctx, state } = fakeCtx()
+      new DshEmailPlugin(ctx, {})
+      eq('W9: no trigger effect is registered', state.effects.length, 0)
+      await sleep(700)
+      eq('W9: zero IMAP connections for a trigger-free account', srv.state.openSockets.length, 0)
+      eq('W9: no trigger warning is logged', state.warns.filter((m) => m.includes('trigger')).length, 0)
+      for (const e of state.effects) e.dispose()
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W10: the three-part prompt, verbatim (no substitution, no excerpt)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(...inboxMessages().slice(0, 1))
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'Forward it to the on-call list.', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W10: the unseen mail is dispatched', await waitFor(() => stub.calls.length >= 1))
+    const expected = [
+      '<dsh-email trigger> New message in INBOX on account "main":',
+      'uid 1 | INTERNALDATE 2026-10-01T10:00:00.000Z | From: one@example.com | Subject: First message',
+      '',
+      'Policy:',
+      'Forward it to the on-call list.',
+      '',
+      '(Execution rules: dsh-email skill, "Trigger session" section.)',
+    ].join('\n')
+    eq('W10: the prompt is the exact three-part template', stub.calls[0].params.prompt, expected)
+    eq('W10: the dispatch carries the account and folder', [stub.calls[0].params.account.name, stub.calls[0].params.trigger.folder], ['main', 'INBOX'])
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W11: a named preset the host cannot resolve: create_failed, the uid
+  //        is not slot-occupied, and each resync retries (visible logs)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const agents = makeAgentsService({})
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', preset: 'missing-preset', idleMs: 1000 },
+      services: { ...AGENTS, agentPresets: makePresetsService({ named: {} }) },
+    })
+    ok('W11: the first dispatch attempt fails create_failed', await waitFor(() => state.warns.some((m) => m.includes('create_failed')), 4000))
+    eq('W11: the agents service was never asked to create a session', agents.creates.length, 0)
+    const first = state.warns.find((m) => m.includes('create_failed'))
+    ok('W11: the failure names the uid and the preset', first.includes('uid 1') && first.includes('missing-preset'))
+    await sleep(1500)
+    const failures = state.warns.filter((m) => m.includes('create_failed'))
+    ok('W11: the next resync retries the uid (no slot occupation, visible log)', failures.length >= 2)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W11b: production dispatcher path (no createSession factory): a named
+  //        preset resolved through the resolveMountable branch, the model
+  //        route from the deployment default soft source, and the setup
+  //        mount of the resolved preset
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'), tm(2, 'B', 'b'))
+    const agents = makeAgentsService({ turnEnd: 'completed' })
+    const presets = makePresetsService({
+      named: { work: 'work-resolved' },
+      resolveMountable: true,
+      defaultId: 'deployment-baseline',
+    })
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', preset: 'work', idleMs: 600000 },
+      services: {
+        agents,
+        agentPresets: presets,
+        agentDefaultModel: { currentSelection: () => ({ provider: 'prov-x', model: 'model-x' }) },
+      },
+    })
+    ok('W11b: the production dispatcher creates the first session', await waitFor(() => agents.creates.length >= 1, 4000))
+    const c1 = agents.creates[0]
+    ok(
+      'W11b: the create carries the deployment default model route (agentDefaultModel soft source)',
+      c1.agentOptions?.provider === 'prov-x' && c1.agentOptions?.model === 'model-x',
+    )
+    eq(
+      'W11b: a named preset goes through the resolveMountable branch, never plain resolve',
+      [presets.resolveCalls.resolveMountable, presets.resolveCalls.resolve],
+      [1, 0],
+    )
+    ok('W11b: the resolved preset is mounted into the unpublished agent scope', presets.mounted.join(','), 'work-resolved')
+    await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1')))
+    ok('W11b: the queued second mail is created with the same route and mount', await waitFor(() => agents.creates.length >= 2))
+    const c2 = agents.creates[1]
+    ok(
+      'W11b: the second create also carries the model route',
+      c2.agentOptions?.provider === 'prov-x' && c2.agentOptions?.model === 'model-x',
+    )
+    eq('W11b: both sessions mounted the preset', presets.mounted.length, 2)
+    eq('W11b: no failures on the happy path', state.warns.length, 0)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W11c: unnamed preset → the deployment default path: no preset
+  //        service and no model-route source means a bare baseline create
+  //        (no setup hook, no agent options)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const agents = makeAgentsService({ turnEnd: 'completed' })
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      services: { agents },
+    })
+    ok('W11c: the unnamed preset dispatches via the deployment default path', await waitFor(() => agents.creates.length >= 1, 4000))
+    const c = agents.creates[0]
+    ok('W11c: the baseline create has no setup hook and no model route', !('setup' in c) && !('agentOptions' in c))
+    ok('W11c: without the dshHomePath service no meta is passed (workspace-less create)', !('meta' in c))
+    ok('W11c: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W11d: workspace meta (root-cause fix): the dshHomePath service yields
+  //        the trigger-runs workspace as meta.cwd (the directory is created),
+  //        and the mounted deployment-default preset lands in meta.agentPreset
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-home-'))
+    try {
+      const agents = makeAgentsService({ turnEnd: 'completed' })
+      const presets = makePresetsService({ defaultId: 'dep-default' })
+      const { watcher, state } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+        services: {
+          agents,
+          agentPresets: presets,
+          dshHomePath: (p) => path.join(home, p),
+        },
+      })
+      ok('W11d: the workspace-aware dispatch creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
+      const c = agents.creates[0]
+      eq('W11d: meta.cwd is the harness-home trigger-runs directory', c.meta?.cwd, path.join(home, 'trigger-runs'))
+      ok('W11d: the workspace directory was created', existsSync(path.join(home, 'trigger-runs')))
+      eq('W11d: the mounted deployment-default preset is recorded in meta.agentPreset', c.meta?.agentPreset, 'dep-default')
+      eq('W11d: the preset was mounted', presets.mounted.join(','), 'dep-default')
+      ok('W11d: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+      eq('W11d: no warnings on the happy path', state.warns.length, 0)
+      watcher.dispose()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W11e: dshHomePath service present but the mkdir fails (the
+  //        trigger-runs path exists as a file): the dispatcher warns and
+  //        degrades to a workspace-less create (the session still runs)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-home-'))
+    writeFileSync(path.join(home, 'trigger-runs'), 'x')
+    try {
+      const agents = makeAgentsService({ turnEnd: 'completed' })
+      const { watcher, state } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+        services: { agents, dshHomePath: (p) => path.join(home, p) },
+      })
+      ok('W11e: the dispatch degrades when the workspace cannot be created', await waitFor(() => agents.creates.length >= 1, 4000))
+      const c = agents.creates[0]
+      ok('W11e: the degraded create carries no cwd in the meta', !c.meta?.cwd)
+      ok('W11e: the workspace failure is warned', state.warns.some((m) => m.includes('trigger workspace preparation failed')))
+      ok('W11e: the session still settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+      watcher.dispose()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W12: dispose semantics: in-flight sessions detach (never cancelled),
+  //         queued uids are dropped (UNSEEN replay), late settles no-op, and
+  //         no reconnect follows
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'), tm(2, 'B', 'b'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W12: boot dispatch with the second mail queued', await waitFor(() => stub.calls.length >= 1))
+    const infosBefore = state.infos.length
+    watcher.dispose()
+    eq('W12: dispose flags the watcher', watcher.disposed, true)
+    ok('W12: the connection is closed on dispose', await waitFor(() => srv.state.openSockets.length === 0, 2000))
+    stub.settleNext({ ok: true })
+    await sleep(100)
+    eq('W12: a late settle on the detached session no-ops (no settle log)', state.infos.length, infosBefore)
+    srv.dropConnections()
+    await sleep(150)
+    eq('W12: no reconnect after dispose', srv.state.openSockets.length, 0)
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W13: the config layer: all seven trigger keys fold with defaults and
+  //         overrides; a malformed key warns, starts no watcher, and leaves
+  //         the account fully usable
+  {
+    const base = envOne('main', { imapPort: 1, smtpPort: 1 })
+    const layer = {
+      accounts: {
+        main: {
+          triggerEnable: true,
+          triggerPrompt: 'layer policy',
+          triggerIdleMs: 2000,
+          triggerMaxConcurrent: 2,
+          triggerQueueMax: 9,
+          triggerPreset: 'pl',
+        },
+      },
+    }
+    const f = foldConfig(base, layer, () => {})
+    const t = f.accounts[0].trigger
+    eq('W13: the config layer folds to an on-state with all seven fields', [
+      t.kind, t.config.prompt, t.config.folder, t.config.idleMs, t.config.maxConcurrent, t.config.queueMax, t.config.preset,
+    ], ['on', 'layer policy', 'INBOX', 2000, 2, 9, 'pl'])
+    const bad = foldConfig(base, { accounts: { main: { triggerIdleMs: 'abc' } } }, () => {})
+    eq('W13: a malformed trigger field yields the malformed state', bad.accounts[0].trigger.kind, 'malformed')
+  }
+  await tServer(async (srv) => {
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1 }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, {
+        accounts: { main: { triggerEnable: true, triggerPrompt: 'layer policy', triggerIdleMs: 2000 } },
+      })
+      eq('W13: the on-account registers one trigger effect', state.effects.length, 1)
+      eq('W13: the effect is labeled per account', state.effects[0].label, 'dsh-email trigger main')
+      ok('W13: the watcher connects', await waitFor(() => srv.state.openSockets.length >= 1, 4000))
+      eq('W13: no warnings on a healthy fold', state.warns.length, 0)
+      for (const e of state.effects) e.dispose()
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+  await tServer(async (srv) => {
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1 }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, { accounts: { main: { triggerIdleMs: 'abc' } } })
+      eq('W13: the malformed account starts no watcher', state.effects.length, 0)
+      ok('W13: the malformed account is named in the warning', state.warns.some((m) => m.includes('malformed') && m.includes('"main"')))
+      const out = doc(await state.tools[0].execute({ verb: 'folders', account: 'main' }))
+      ok('W13: the account entry stays alive (folders verb succeeds)', out && Array.isArray(out.folders))
+      await sleep(300)
+      eq('W13: and no connection is opened for it', srv.state.openSockets.length, 0)
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W14: an enabled trigger without a prompt is malformed: it warns and
+  //         starts no watcher; the sibling healthy account is unaffected
+  await tServer(async (srv) => {
+    const env = {
+      ...envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }),
+      ...envOne('alt', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true } }),
+    }
+    await withTriggerEnv(env, async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, {})
+      eq('W14: only the healthy account registers a trigger effect', [state.effects.length, state.effects[0]?.label], [1, 'dsh-email trigger main'])
+      ok('W14: the prompt-less account is named in the malformed warning', state.warns.some((m) => m.includes('malformed') && m.includes('"alt"')))
+      ok('W14: the healthy watcher connects', await waitFor(() => srv.state.openSockets.length >= 1, 4000))
+      eq('W14: exactly one connection (the malformed account opens none)', srv.state.openSockets.length, 1)
+      for (const e of state.effects) e.dispose()
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W15: the server pushes no EXISTS for a new mail (or the client misses
+  //         it): the heartbeat resync catches it
+  await tServer(async (srv) => {
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 1000 },
+      createSession: stub.fn,
+    })
+    await sleep(1500)
+    eq('W15: an empty mailbox dispatches nothing', stub.calls.length, 0)
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    ok('W15: the heartbeat resync catches the mail without an EXISTS push', await waitFor(() => stub.calls.length >= 1, 4000) && stub.uids()[0] === 1)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W16: a silent transport (bytes stop flowing, the socket stays open)
+  //        is detected and healed: backoff, a fresh connection, and the
+  //        resync on it dispatches mail that arrived during the blackout
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 2000 },
+      timeout: 2000,
+      createSession: stub.fn,
+    })
+    ok('W16: boot dispatch happens before the blackout', await waitFor(() => stub.calls.length >= 1))
+    stub.settleNext()
+    srv.state.folders.INBOX.messages[0].flags.add('\\Seen')
+    srv.state.folders.INBOX.messages.push(tm(2, 'B', 'b'))
+    srv.goSilent()
+    const warnsBefore = state.warns.length
+    ok('W16: the blackout is detected and routed to the backoff', await waitFor(() => state.warns.length > warnsBefore, 15000))
+    ok('W16: a fresh connection is established after the backoff', await waitFor(() => srv.state.connections.length >= 2, 20000))
+    srv.resume()
+    ok('W16: the resync on the fresh connection dispatches the mail that arrived during the blackout', await waitFor(() => stub.calls.length >= 2, 10000) && stub.uids()[1] === 2)
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W17: the only terminal state: the listened folder does not exist on
+  //         the server (EXAMINE NO). No retry loop; the watcher stops with
+  //         a visible error and self-heals on a config change upstream.
+  await tServer(async (srv) => {
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', folder: 'Nope' },
+    })
+    ok('W17: the missing folder stops the watcher with a visible error', await waitFor(() => state.errors.some((m) => m.includes('stopped: folder "Nope"')), 6000))
+    const conns = srv.state.connections.length
+    eq('W17: exactly one connection was attempted', conns, 1)
+    await sleep(6500)
+    eq('W17: no reconnect after the terminal state (the 5s backoff did not fire)', srv.state.connections.length, conns)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W18: trigger enabled, but the host provides no agents service: warn,
+  //         zero watchers, zero connections (the accounts stay usable)
+  await tServer(async (srv) => {
+    const env = envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } })
+    await withTriggerEnv(env, async () => {
+      const { ctx, state } = fakeCtx()
+      new DshEmailPlugin(ctx, {})
+      eq('W18: no watcher without the agents service', state.effects.length, 0)
+      ok('W18: the missing agents service is warned', state.warns.some((m) => m.includes('no agents service')))
+      await sleep(700)
+      eq('W18: zero IMAP connections', srv.state.openSockets.length, 0)
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W19: a malformed trigger via the env channel: parseEnv stays silent,
+  //         the constructor warns, no watcher, and every mail verb still works
+  await tServer(async (srv) => {
+    const env = envOne('main', {
+      imapPort: srv.port,
+      smtpPort: 1,
+      trigger: { enable: true, prompt: 'P', queueMax: -5 },
+    })
+    const parseWarns = []
+    parseEnv(env, (m) => parseWarns.push(m))
+    eq('W19: the env channel is silent about trigger violations', parseWarns.length, 0)
+    await withTriggerEnv(env, async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, {})
+      eq('W19: the constructor warns exactly once (malformed)', state.warns.filter((m) => m.includes('malformed')).length, 1)
+      eq('W19: no watcher starts', state.effects.length, 0)
+      const out = doc(await state.tools[0].execute({ verb: 'folders', account: 'main' }))
+      ok('W19: the mail verbs keep working on the malformed account', out && Array.isArray(out.folders))
+      await sleep(400)
+      eq('W19: zero IMAP connections', srv.state.openSockets.length, 0)
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W19b: env channel with two accounts: one malformed (a negative
+  //        queueMax) and one valid — the valid account's watcher still
+  //        starts and the sibling is named in the warning
+  await tServer(async (srv) => {
+    const env = {
+      ...envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }),
+      ...envOne('alt', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'X', queueMax: -5 } }),
+    }
+    await withTriggerEnv(env, async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, {})
+      eq('W19b: only the valid account registers a trigger effect (env channel)', [state.effects.length, state.effects[0]?.label], [1, 'dsh-email trigger main'])
+      ok('W19b: the malformed account is named in the warning', state.warns.some((m) => m.includes('malformed') && m.includes('"alt"')))
+      ok('W19b: the valid account watcher connects', await waitFor(() => srv.state.openSockets.length >= 1, 4000))
+      eq('W19b: exactly one connection (the malformed account opens none)', srv.state.openSockets.length, 1)
+      for (const e of state.effects) e.dispose()
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+}
+
 // selftest hygiene guard
 {
+  // The code base is self-contained and decoupled from any design document:
+  // the same pattern set applies to the test source and to every shipped
+  // source file (no doc pointers, no machine paths, no line pointers, no
+  // review-round or version-round tags, no CJK).
+  const patterns = [
+    ['design-doc section pointers', /design doc|design v\d|\u00a7\d/],
+    ['machine-specific paths', /\/workspace\//],
+    ['source line-number pointers', /L\d+[-\u2013\u2014]L?\d+/],
+    ['review-round wrappers', /round-?\d+|review #\d/],
+    ['project version-round tags', /\bv\d{2}\b/],
+    ['CJK characters', CJK_RE],
+    ['review finding identifiers', /R\d{1,2}-[A-Za-z]\w*/],
+    ['version-round identifiers', /\bv\d{2}[A-Za-z_]\w*/],
+  ]
   const raw = readFileSync(path.join(PKG, 'test', 'selftest.mjs'), 'utf8')
-  const testSrc = raw.slice(0, raw.indexOf('// selftest hygiene guard'))
-  ok('selftest hygiene: no design-doc section pointers', !/design doc|design v\d|\u00a7\d/.test(testSrc))
-  ok('selftest hygiene: no machine-specific paths', !/\/workspace\//.test(testSrc))
-  ok('selftest hygiene: no source line-number pointers', !/L\d+[-\u2013\u2014]L?\d+/.test(testSrc))
-  ok('selftest hygiene: no review-round wrappers', !/round-?\d+|review #\d/.test(testSrc))
-  ok('selftest hygiene: no project version-round tags', !/\bv\d{2}\b/.test(testSrc))
-  ok('selftest hygiene: no CJK characters', !CJK_RE.test(testSrc))
-  ok('selftest hygiene: no review finding identifiers', !/R\d{1,2}-[A-Za-z]\w*/.test(testSrc))
-  ok('selftest hygiene: no version-round identifiers', !/\bv\d{2}[A-Za-z_]\w*/.test(testSrc))
+  const sources = { 'test/selftest.mjs': raw.slice(0, raw.indexOf('// selftest hygiene guard')) }
+  for (const f of readdirSync(path.join(PKG, 'src'))) {
+    if (!f.endsWith('.ts')) continue
+    sources[`src/${f}`] = readFileSync(path.join(PKG, 'src', f), 'utf8')
+  }
+  for (const [file, code] of Object.entries(sources)) {
+    for (const [label, re] of patterns) {
+      ok(`hygiene ${file}: no ${label}`, !re.test(code))
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,9 @@
 // dsh-email IMAP session layer: every tool call opens one fresh connection
 // (connect + command + close, no pooling, no idle keep-alive) under a single
-// timeout deadline covering the whole call. Multi-phase operations (fetch,
+// timeout deadline covering the whole call. The v1.9 trigger watcher holds
+// exactly one resident connection per trigger-enabled account (see
+// buildWatcherConnection: auto-IDLE on, re-created per (re)connect).
+// Multi-phase operations (fetch,
 // part downloads on one message) share the one connection of their call
 // through an ImapSession. imapflow 2.x natively satisfies the protocol
 // contracts this plugin relies on: content fetches use BODY.PEEK/BINARY.PEEK
@@ -14,7 +17,7 @@
 // All helpers surface failures as EmailError with the closed code vocabulary
 // (auth / network / tls / timeout / protocol / server); the raw upstream text
 // is preserved in the message for pass-through to the agent.
-import { ImapFlow, type FetchMessageObject, type FetchQueryObject, type IdInfoObject, type ListResponse, type MessageStructureObject, type SearchObject } from 'imapflow'
+import { ImapFlow, type FetchMessageObject, type FetchQueryObject, type IdInfoObject, type ImapFlowOptions, type ListResponse, type MessageStructureObject, type SearchObject } from 'imapflow'
 
 import type { AccountConfig } from './types.js'
 import { classifyError, EmailError, errMsg, LocalError, PLUGIN_NAME, PLUGIN_VERSION, toBuffer, withDeadline } from './util.js'
@@ -48,25 +51,24 @@ function captureFrom(capture: CommandErrorCapture, e: unknown): void {
 }
 
 /**
- * Build one fresh ImapFlow connection for an account endpoint from its TLS
- * mode: 'tls' is a direct handshake (secure=true, STARTTLS off), 'starttls'
- * is a mandatory upgrade (secure=false, doSTARTTLS=true - a server without
- * STARTTLS fails the connection, never a plaintext downgrade), and 'none'
- * stays on plaintext without ever attempting STARTTLS (secure=false,
- * doSTARTTLS=false). The explicit per-account certificate-validation
- * downgrade and every library timeout are bound to the account budget (the
- * overall deadline in the call wrapper is the authority; the library codes
- * back it up). The logger is a capture sink (see CommandErrorCapture), not a
- * console logger.
+ * The shared ImapFlow options for an account endpoint, common to both
+ * connection classes (the per-call verb connection and the resident trigger
+ * watcher connection): 'tls' is a direct handshake (secure=true, STARTTLS
+ * off), 'starttls' is a mandatory upgrade (secure=false, doSTARTTLS=true - a
+ * server without STARTTLS fails the connection, never a plaintext downgrade),
+ * and 'none' stays on plaintext without ever attempting STARTTLS (secure=
+ * false, doSTARTTLS=false). The explicit per-account certificate-validation
+ * downgrade and every library timeout are bound to the account budget. The
+ * logger is a capture sink (see CommandErrorCapture), not a console logger.
  * @param acct the account config.
+ * @param capture the rejection capture object the logger sink feeds.
  */
-function buildConnection(acct: AccountConfig): { client: ImapFlow; capture: CommandErrorCapture } {
-  const capture: CommandErrorCapture = {}
+function sharedOptions(acct: AccountConfig, capture: CommandErrorCapture): ImapFlowOptions {
   const sink = (obj: unknown): void => {
     const entry = obj as { err?: { responseStatus?: unknown; responseText?: unknown } } | undefined
     if (entry?.err !== undefined) captureFrom(capture, entry.err)
   }
-  const client = new ImapFlow({
+  return {
     host: acct.imap.host,
     port: acct.imap.port,
     // 'tls' is a direct handshake; every other mode starts on plaintext.
@@ -79,7 +81,6 @@ function buildConnection(acct: AccountConfig): { client: ImapFlow; capture: Comm
     doSTARTTLS: acct.imap.tls === 'starttls',
     auth: { user: acct.user, pass: acct.pass },
     clientInfo: CLIENT_INFO,
-    disableAutoIdle: true,
     // The account field carries the operator-facing semantics of the env
     // variable (default false = strict validation; true = explicitly accept
     // untrusted / self-signed certificates). Node's rejectUnauthorized is the
@@ -89,9 +90,47 @@ function buildConnection(acct: AccountConfig): { client: ImapFlow; capture: Comm
     connectionTimeout: acct.timeoutMs,
     greetingTimeout: acct.timeoutMs,
     socketTimeout: acct.timeoutMs,
-  })
+  }
+}
+
+/**
+ * Build one fresh per-call ImapFlow connection for an account endpoint. The
+ * auto-IDLE keep-alive is disabled (a tool call opens, works, and closes; no
+ * resident socket).
+ * @param acct the account config.
+ */
+function buildConnection(acct: AccountConfig): { client: ImapFlow; capture: CommandErrorCapture } {
+  const capture: CommandErrorCapture = {}
+  const client = new ImapFlow({ ...sharedOptions(acct, capture), disableAutoIdle: true })
   // Command rejections that the logger sink does not record still surface as
   // client error events; capture the status from both channels.
+  client.on('error', (err: unknown) => {
+    captureFrom(capture, err)
+  })
+  return { client, capture }
+}
+
+/**
+ * Build one resident ImapFlow connection for the trigger watcher (v1.9): the
+ * same options as the per-call builder with the one deliberate difference -
+ * auto-IDLE is NOT disabled. The library idles the connection on its own
+ * (and re-arms after each command), and the always-running socket reader
+ * decodes untagged EXISTS lines (IDLE or not) into the client-level
+ * 'exists' event the watcher listens on. A fresh instance is created on every
+ * (re)connect; listeners are re-registered by the caller each time (imapflow
+ * forbids reusing a closed instance: a second connect() throws InstanceReused).
+ * @param acct the account config.
+ * @param extra extra ImapFlow options overriding the shared ones (the
+ *   production call site passes none; the selftest uses it to speed the
+ *   auto-IDLE cadence up so the NOIDLE-server command-poll branch is
+ *   exercisable in a short window).
+ */
+export function buildWatcherConnection(
+  acct: AccountConfig,
+  extra: Partial<ImapFlowOptions> = {},
+): { client: ImapFlow; capture: CommandErrorCapture } {
+  const capture: CommandErrorCapture = {}
+  const client = new ImapFlow({ ...sharedOptions(acct, capture), ...extra })
   client.on('error', (err: unknown) => {
     captureFrom(capture, err)
   })

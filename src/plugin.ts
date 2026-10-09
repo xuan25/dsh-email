@@ -4,17 +4,23 @@
 // config layer delivered by the cordis loader (a patch entry targeting this
 // plugin's id with a `config` object): the delivered fields are validated
 // against the static Config schema and folded onto the env record before
-// parsing (foldConfig in config.ts). Pure transport: no pooling, no idle
-// keep-alive, no state; every verb call opens one fresh connection under the
-// account timeout budget. The constructor registers exactly three things: the
-// email tool (sixteen verbs), the bundled dsh-email skill, and a one-line
-// system-prompt pointer.
+// parsing (foldConfig in config.ts). The verb plane is pure transport: no
+// pooling, no idle keep-alive, no state; every verb call opens one fresh
+// connection under the account timeout budget. The constructor registers
+// the email tool (sixteen verbs), the bundled dsh-email skill, and a
+// one-line system-prompt pointer; with the v1.9 new-mail trigger it also
+// starts one per-account trigger watcher (a resident IMAP connection that
+// dispatches a fresh agent session per new mail) as a fiber effect for each
+// trigger-enabled account. The watcher services agents / agentPresets /
+// dshHomePath are SOFT reads (ctx.get, never inject): a host without them
+// degrades to a visible warning and no watcher.
 import Schema from '@deepseek-ai/schemastery'
 import { Service, type Context } from '@deepseek-ai/cordis'
 import { PLUGIN_NAME } from './util.js'
 import { foldConfig, NAME_RE, type DeliveredConfig } from './config.js'
 import { registerTool } from './tool.js'
 import { registerSkill } from './skill.js'
+import { MailWatcher } from './watch.js'
 
 /** The TLS-mode field: the three mode words, matched case-insensitively (the env contract does the same). */
 function tlsModeField(): Schema {
@@ -39,6 +45,13 @@ const ACCOUNT_FIELDS = {
   sentFolderAutocreate: 'create a missing sent folder and retry the copy (default true; INBOX is never created)',
   allowDelete: 'allow the delete / delete_folder verbs on this account (default false)',
   timeoutMs: 'the per-call timeout budget in milliseconds (default 120000)',
+  triggerEnable: 'enable the new-mail trigger watcher for this account (default false)',
+  triggerPrompt: 'the policy prompt injected verbatim into each trigger session (required when triggerEnable is true)',
+  triggerFolder: 'the folder the trigger watcher listens on (default INBOX)',
+  triggerIdleMs: 'the trigger heartbeat resync period in milliseconds (default 600000, lower bound 1000)',
+  triggerMaxConcurrent: 'max concurrent trigger sessions on this account (default 1)',
+  triggerQueueMax: 'max queued (waiting) new mails before visible overflow; overflow stays UNSEEN (default 100)',
+  triggerPreset: 'named agent preset for trigger sessions (default: the deployment default)',
 } as const
 
 /** The label of the per-account schema in validation messages. */
@@ -91,6 +104,19 @@ const ACCOUNT_CONFIG = rejectUnknownKeys(
     sentFolderAutocreate: Schema.boolean().description(ACCOUNT_FIELDS.sentFolderAutocreate),
     allowDelete: Schema.boolean().description(ACCOUNT_FIELDS.allowDelete),
     timeoutMs: Schema.number().min(1).step(1).description(ACCOUNT_FIELDS.timeoutMs),
+    // The seven trigger fields are deliberately unconstrained at the schema
+    // layer (Schema.any(), zero constraints): a type declaration here would
+    // fail the entry loudly on a config-layer type mismatch at boot, while
+    // the runtime validator (parseTriggerFields in config.ts, the single
+    // validation point) reports a per-account warning instead and leaves the
+    // account fully usable. Non-string values survive the fold as raw values.
+    triggerEnable: Schema.any().description(ACCOUNT_FIELDS.triggerEnable),
+    triggerPrompt: Schema.any().description(ACCOUNT_FIELDS.triggerPrompt),
+    triggerFolder: Schema.any().description(ACCOUNT_FIELDS.triggerFolder),
+    triggerIdleMs: Schema.any().description(ACCOUNT_FIELDS.triggerIdleMs),
+    triggerMaxConcurrent: Schema.any().description(ACCOUNT_FIELDS.triggerMaxConcurrent),
+    triggerQueueMax: Schema.any().description(ACCOUNT_FIELDS.triggerQueueMax),
+    triggerPreset: Schema.any().description(ACCOUNT_FIELDS.triggerPreset),
   }),
   ACCOUNT_CONFIG_LABEL,
 )
@@ -100,17 +126,23 @@ const ACCOUNT_CONFIG = rejectUnknownKeys(
  * The constructor performs synchronous initialization (logger, resolution of
  * the delivered config layer onto the EMAIL_* env contract with per-account
  * drop warnings, tool / skill / system-prompt section registration); there is
- * no init lifecycle step because the plugin owns no long-lived effect (the
- * three registrations are framework-tracked effects disposed with the owning
- * fiber).
- * inject = every service the plugin reads: the dsh host services tools / skills /
- * systemPrompt (dsh-tools / dsh-skill / dsh-system-prompt: ctx.tools.register /
- * ctx.skills.registerProvider / ctx.systemPrompt.section). Declaring all three
- * converts a host-missing-the-service failure from a cryptic property error into
- * the clear `cannot get required service "X"`, keeping the declaration consistent
- * with the actual read sites (same convention as dsh-timer). A declared service
- * with no implementation parks the plugin fiber (it never activates, it does not
- * throw).
+ * no init lifecycle step because every long-lived effect is registered inside
+ * the constructor itself: the three registrations are framework-tracked
+ * effects, and (v1.9) each trigger-enabled account starts its new-mail
+ * trigger watcher through ctx.effect (one effect per account, disposed with
+ * the owning fiber: watcher.dispose() runs the synchronous
+ * invalidate-then-close order).
+ * inject = every service the plugin reads HARD: the dsh host services
+ * tools / skills / systemPrompt (dsh-tools / dsh-skill / dsh-system-prompt:
+ * ctx.tools.register / ctx.skills.registerProvider / ctx.systemPrompt
+ * .section). Declaring all three converts a host-missing-the-service failure
+ * from a cryptic property error into the clear `cannot get required service
+ * "X"`, keeping the declaration consistent with the actual read sites (same
+ * convention as dsh-timer). A declared service with no implementation parks
+ * the plugin fiber (it never activates, it does not throw). The trigger
+ * watcher's services (agents / agentPresets / dshHomePath) are deliberately
+ * NOT declared: they are soft reads (ctx.get), so a host without them degrades
+ * to a visible warning and no watcher instead of parking the plugin fiber.
  * The static Config schema validates the delivered config layer before the
  * constructor runs (a violation fails the entry loudly); the constructor folds
  * it onto the env record through the existing parser (foldConfig): a delivered
@@ -147,6 +179,50 @@ export class DshEmailPlugin extends Service {
         'Read and send mail through configured IMAP/SMTP accounts with the email tool; ' +
         'see the dsh-email skill for the verb reference, the EMAIL_* env contract, and limits.',
     })
+    // v1.9: start the per-account new-mail trigger watchers (one fiber
+    // effect each). A malformed trigger configuration warns and starts no
+    // watcher (the account stays fully usable through every mail verb); an
+    // 'on' account on a host without the agents service warns once and
+    // starts no watcher either (zero connections, zero sessions).
+    const onAccounts = cfg.accounts.filter((a) => a.trigger.kind === 'on')
+    let hasAgents = false
+    if (onAccounts.length > 0) {
+      let agents: unknown
+      try {
+        agents = ctx.get('agents')
+      } catch {
+        agents = undefined
+      }
+      hasAgents = agents !== undefined && agents !== null
+      if (!hasAgents) {
+        const names = onAccounts.map((a) => `"${a.name}"`).join(', ')
+        logger.warn(
+          `new-mail trigger is enabled for account(s) ${names} but the host provides no agents service; ` +
+            'no watcher was started (the accounts stay fully usable through every mail verb)',
+        )
+      }
+    }
+    for (const acct of cfg.accounts) {
+      if (acct.trigger.kind === 'malformed') {
+        logger.warn(
+          `account "${acct.name}": trigger configuration is malformed (${acct.trigger.reason}); ` +
+            'no watcher started for this account (all mail verbs are unaffected)',
+        )
+        continue
+      }
+      if (acct.trigger.kind !== 'on' || !hasAgents) continue
+      const trigger = acct.trigger.config
+      ctx.effect(
+        () => {
+          const watcher = new MailWatcher({ ctx, account: acct, trigger })
+          watcher.start()
+          return (): void => {
+            watcher.dispose()
+          }
+        },
+        `dsh-email trigger ${acct.name}`,
+      )
+    }
   }
 }
 

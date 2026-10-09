@@ -10,14 +10,20 @@
 // wire (MAIL FROM, the From header, the Message-ID domain).
 // EMAIL_DEFAULT_ACCOUNT is stored raw and resolved at call time, so a stale
 // default only fails the calls that rely on it. EMAIL_READ_BODY_LIMIT is the
-// single global knob for the read-verb body budget.
+// single global knob for the read-verb body budget. The seven TRIGGER_*
+// fields (v1.9) configure the per-account new-mail watcher: they validate
+// through the shared parseTriggerFields at the watcher construction entry
+// (malformed values stop only that account's watcher, never the account or
+// the entry itself); the account-level required-field rule is untouched.
 // The delivered layer is folded onto a copy of the env record before parsing:
 // a delivered field is an explicit value (it beats the env value, which beats
 // the built-in default); fields the layer omits resolve as the env contract.
 // A config account missing a required field is dropped with a warning, the
 // same rule as env. Layer composition (which patch layer wins, no deep merge)
 // is cordis semantics: the plugin sees only the one object the loader delivers.
-import type { AccountConfig, EmailConfig, TlsEndpoint, TlsMode } from './types.js'
+import { errMsg } from './util.js'
+
+import type { AccountConfig, EmailConfig, TlsEndpoint, TlsMode, TriggerState } from './types.js'
 
 /** Account name charset: lowercase start, 1-32 chars (same convention as dsh-timer job ids). */
 export const NAME_RE = /^[a-z][a-z0-9-]{0,31}$/
@@ -40,6 +46,13 @@ const FIELDS = new Set([
   'SENT_FOLDER_AUTOCREATE',
   'ALLOW_DELETE',
   'TIMEOUT_MS',
+  'TRIGGER_ENABLE',
+  'TRIGGER_PROMPT',
+  'TRIGGER_FOLDER',
+  'TRIGGER_IDLE_MS',
+  'TRIGGER_MAX_CONCURRENT',
+  'TRIGGER_QUEUE_MAX',
+  'TRIGGER_PRESET',
 ])
 
 /** The four fields whose absence drops the account. */
@@ -63,10 +76,39 @@ export const DEFAULT_TIMEOUT_MS = 120_000
 /** Default read-body budget in characters. */
 export const DEFAULT_READ_BODY_LIMIT = 20_000
 
+// --- New-mail trigger watcher (v1.9): per-account defaults -------------------
+/** Default trigger heartbeat / resync period in ms (10-minute industry anchor). */
+export const DEFAULT_TRIGGER_IDLE_MS = 600_000
+/** Lower bound of the trigger heartbeat period in ms (reject, not clamp). */
+export const TRIGGER_IDLE_MS_MIN = 1_000
+/** Default trigger session concurrency per account (1 = strictly serial). */
+export const DEFAULT_TRIGGER_MAX_CONCURRENT = 1
+/** Default trigger queue capacity per account (waiting uids). */
+export const DEFAULT_TRIGGER_QUEUE_MAX = 100
+/** Default trigger listen folder. */
+export const DEFAULT_TRIGGER_FOLDER = 'INBOX'
+
+/** The seven per-account trigger field suffixes (the trigger watcher surface). */
+const TRIGGER_FIELDS = new Set([
+  'TRIGGER_ENABLE',
+  'TRIGGER_PROMPT',
+  'TRIGGER_FOLDER',
+  'TRIGGER_IDLE_MS',
+  'TRIGGER_MAX_CONCURRENT',
+  'TRIGGER_QUEUE_MAX',
+  'TRIGGER_PRESET',
+])
+
 interface RawAccount {
   name: string
   upper: string
   fields: Record<string, string>
+  /**
+   * The raw trigger field values, kept at their original type (the config
+   * layer can deliver non-string scalars through Schema.any()); the shared
+   * trigger validator reads this, not the string-only `fields`.
+   */
+  triggerRaw: Record<string, unknown>
 }
 
 /**
@@ -123,6 +165,95 @@ export function parseTlsMode(value: string): TlsMode | undefined {
   }
 }
 
+/** Internal: the malformed-reason carrier of parseTriggerFields. */
+class TriggerFieldError extends Error {
+  readonly reason: string
+  constructor(reason: string) {
+    super(reason)
+    this.reason = reason
+    this.name = 'TriggerFieldError'
+  }
+}
+
+/**
+ * The single shared validator for the seven trigger fields:
+ * both the env path and the config path materialize into the same record and
+ * converge here at the watcher construction entry, so one function is the
+ * only validation point. Rules: any present field is validated (a type or
+ * range violation anywhere = malformed, even when enable is false); valid +
+ * enable=false = off (a present prompt is silently ignored); valid +
+ * enable=true = the prompt must be present and non-blank, else malformed;
+ * otherwise on with the defaults filled in (folder INBOX, idleMs
+ * 600000, maxConcurrent 1, queueMax 100; idleMs floor 1000 = reject, not
+ * clamp; preset optional = deployment default).
+ * @param raw the raw materialized values of the seven fields (any type:
+ * strings from env, stringified scalars or pass-through values from the
+ * config layer; absent/undefined/null keys are treated as not set).
+ * @returns the resolved trigger state of the account.
+ */
+export function parseTriggerFields(raw: Record<string, unknown>): TriggerState {
+  const present: Record<string, unknown> = {}
+  for (const f of TRIGGER_FIELDS) {
+    const v = raw[f]
+    if (v !== undefined && v !== null) present[f] = v
+  }
+  if (Object.keys(present).length === 0) return { kind: 'off' }
+
+  // Scalar coercion: strings and stringified config scalars pass through;
+  // any other type (an object or array delivered through Schema.any()) is a
+  // type violation = malformed, never silently dropped.
+  const toStr = (v: unknown): string | null =>
+    typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : null
+
+  const requireString = (field: string, min = 0): string => {
+    const s = toStr(present[field])
+    if (s === null) throw new TriggerFieldError(`${field} must be a string`)
+    if (s.trim().length <= min) throw new TriggerFieldError(`${field} must not be blank`)
+    return s
+  }
+  const requirePositiveInt = (field: string, min: number): number => {
+    const s = toStr(present[field])
+    if (s === null) throw new TriggerFieldError(`${field} must be an integer`)
+    const n = parseIntBounded(s, min, Number.MAX_SAFE_INTEGER)
+    if (n === undefined) throw new TriggerFieldError(`${field} "${s}" must be an integer >= ${min}`)
+    return n
+  }
+
+  try {
+    let enable = false
+    if ('TRIGGER_ENABLE' in present) {
+      const s = toStr(present.TRIGGER_ENABLE)
+      if (s === null) throw new TriggerFieldError('TRIGGER_ENABLE must be a boolean')
+      const b = parseBoolean(s)
+      if (b === undefined) throw new TriggerFieldError(`TRIGGER_ENABLE "${s}" is not a boolean (true/false)`)
+      enable = b
+    }
+    const prompt = 'TRIGGER_PROMPT' in present ? requireString('TRIGGER_PROMPT') : ''
+    const folder = 'TRIGGER_FOLDER' in present ? requireString('TRIGGER_FOLDER') : DEFAULT_TRIGGER_FOLDER
+    const idleMs = 'TRIGGER_IDLE_MS' in present
+      ? requirePositiveInt('TRIGGER_IDLE_MS', TRIGGER_IDLE_MS_MIN)
+      : DEFAULT_TRIGGER_IDLE_MS
+    const maxConcurrent = 'TRIGGER_MAX_CONCURRENT' in present
+      ? requirePositiveInt('TRIGGER_MAX_CONCURRENT', 1)
+      : DEFAULT_TRIGGER_MAX_CONCURRENT
+    const queueMax = 'TRIGGER_QUEUE_MAX' in present
+      ? requirePositiveInt('TRIGGER_QUEUE_MAX', 1)
+      : DEFAULT_TRIGGER_QUEUE_MAX
+    const preset = 'TRIGGER_PRESET' in present ? requireString('TRIGGER_PRESET') : undefined
+
+    if (!enable) return { kind: 'off' }
+    if (prompt.trim() === '') {
+      throw new TriggerFieldError('trigger is enabled but TRIGGER_PROMPT is missing or empty')
+    }
+    return {
+      kind: 'on',
+      config: { prompt, folder, idleMs, maxConcurrent, queueMax, ...(preset !== undefined ? { preset } : {}) },
+    }
+  } catch (err) {
+    return { kind: 'malformed', reason: err instanceof TriggerFieldError ? err.reason : errMsg(err) }
+  }
+}
+
 /**
  * Parse the EMAIL_* env contract.
  * @param env env record (process.env at boot, or a test fixture).
@@ -133,7 +264,6 @@ export function parseTlsMode(value: string): TlsMode | undefined {
 export function parseEnv(env: Record<string, string | undefined>, warn: (msg: string) => void): EmailConfig {
   const raw: RawAccount[] = []
   for (const [key, value] of Object.entries(env)) {
-    if (typeof value !== 'string') continue
     const m = ACCOUNT_VAR_RE.exec(key)
     if (!m) continue
     const field = m[2]
@@ -141,9 +271,17 @@ export function parseEnv(env: Record<string, string | undefined>, warn: (msg: st
     const upper = m[1].toUpperCase()
     let acct = raw.find((r) => r.upper === upper)
     if (!acct) {
-      acct = { name: upper.toLowerCase(), upper, fields: {} }
+      acct = { name: upper.toLowerCase(), upper, fields: {}, triggerRaw: {} }
       raw.push(acct)
     }
+    if (TRIGGER_FIELDS.has(field)) {
+      // Trigger values keep their original type (the config layer delivers
+      // non-string scalars through Schema.any() and they must reach the
+      // shared validator instead of being dropped): last one wins.
+      acct.triggerRaw[field] = value
+      continue
+    }
+    if (typeof value !== 'string') continue
     if (acct.fields[field] !== undefined && acct.fields[field] !== value) {
       warn(`account "${acct.name}" has conflicting ${key} values; last one wins`)
     }
@@ -224,6 +362,13 @@ export interface DeliveredAccountConfig {
   sentFolderAutocreate?: boolean
   allowDelete?: boolean
   timeoutMs?: number
+  triggerEnable?: boolean
+  triggerPrompt?: string
+  triggerFolder?: string
+  triggerIdleMs?: number
+  triggerMaxConcurrent?: number
+  triggerQueueMax?: number
+  triggerPreset?: string
 }
 
 /**
@@ -255,6 +400,13 @@ const CONFIG_FIELD_TO_ENV: Record<string, string> = {
   sentFolderAutocreate: 'SENT_FOLDER_AUTOCREATE',
   allowDelete: 'ALLOW_DELETE',
   timeoutMs: 'TIMEOUT_MS',
+  triggerEnable: 'TRIGGER_ENABLE',
+  triggerPrompt: 'TRIGGER_PROMPT',
+  triggerFolder: 'TRIGGER_FOLDER',
+  triggerIdleMs: 'TRIGGER_IDLE_MS',
+  triggerMaxConcurrent: 'TRIGGER_MAX_CONCURRENT',
+  triggerQueueMax: 'TRIGGER_QUEUE_MAX',
+  triggerPreset: 'TRIGGER_PRESET',
 }
 
 /**
@@ -325,6 +477,7 @@ function buildAccount(e: RawAccount, valid: boolean): { account: AccountConfig }
     sentFolderAutocreate: true,
     allowDelete: false,
     isDefault: false,
+    trigger: parseTriggerFields(e.triggerRaw),
   }
   if (f.FROM_NAME !== undefined && f.FROM_NAME.trim() !== '') account.fromName = f.FROM_NAME.trim()
   if (f.SENT_FOLDER !== undefined && f.SENT_FOLDER.trim() !== '') account.sentFolder = f.SENT_FOLDER.trim()

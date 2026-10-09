@@ -76,6 +76,19 @@
 // The state object also keeps one record per accepted connection (its
 // command log), so a test can assert how many connections a call opened.
 //
+// Trigger-watcher test driving (the handle exposes the same knobs over all
+// open connections; per-connection access goes through the conn records):
+//   pushExists(folder, count) - send `* <count> EXISTS` to every open
+//                   connection that has `folder` selected (a new-mail event
+//                   mid-IDLE, no state change: the test appends the message
+//                   to the folder itself)
+//   dropConnections()         - destroy every open socket server-side (the
+//                   client sees an unexpected close and must reconnect)
+//   goSilent() / resume()     - make every open connection stop answering /
+//                   answer again (a black-holed transport: bytes in, nothing
+//                   out, no close)
+//   conn.selected / isOpen() / sendRaw(line) / goSilent() / resume() / drop()
+//
 // Message fixtures render their own MIME source from the parts tree, so the
 // delivered source and the BODYSTRUCTURE / part MIME headers never disagree.
 
@@ -471,8 +484,41 @@ function evalCriteria(tokens, pos, msg) {
 /** One live connection: socket plus per-connection protocol state. */
 function handleImapSocket(socket, serverState) {
   // one record per accepted connection: the selftest asserts on it how many
-  // connections a tool call opened (the single-session contract)
-  const conn = { commands: [] }
+  // connections a tool call opened (the single-session contract). The trigger
+  // watcher tests additionally drive the connection from the test side
+  // (injecting untagged lines, silencing the transport, dropping the socket)
+  // through the record's methods; the send/silent/stopped state they touch
+  // lives in this closure.
+  const conn = {
+    commands: [],
+    /** The mailbox name this connection currently has selected (null = none). */
+    get selected() {
+      return selected
+    },
+    /** True while the server still holds this socket open. */
+    isOpen() {
+      return serverState.openSockets.includes(socket)
+    },
+    /** Send one raw line to the client (CRLF-terminated, Latin-1). */
+    sendRaw: (text) => send(text),
+    /** Stop answering: every later command is consumed and never replied. */
+    goSilent: () => {
+      silent = true
+    },
+    /** Resume answering (the connection stays otherwise untouched). */
+    resume: () => {
+      silent = false
+    },
+    /** Destroy the socket server-side (the client sees a close). */
+    drop: () => {
+      stopped = true
+      try {
+        live.destroy()
+      } catch {
+        // the socket may already be gone; the close bookkeeping still runs
+      }
+    },
+  }
   serverState.connections.push(conn)
   serverState.openSockets.push(socket)
   let upgraded = false
@@ -1106,5 +1152,29 @@ export async function startImapServer(opts = {}) {
         server.close(() => resolve())
         for (const s of serverState.openSockets ?? []) s.destroy()
       }),
+    /**
+     * Push one untagged line to every open connection that has the given
+     * mailbox selected (the EXISTS injection for the trigger watcher tests:
+     * a new-mail event the server would send mid-IDLE).
+     * @param folderName the mailbox name the connections must have selected.
+     * @param count the new message count for the `* <count> EXISTS` line.
+     */
+    pushExists: (folderName, count) => {
+      for (const c of serverState.connections) {
+        if (c.isOpen() && c.selected === folderName) c.sendRaw(`* ${count} EXISTS`)
+      }
+    },
+    /** Destroy every open connection server-side (simulates a transport loss). */
+    dropConnections: () => {
+      for (const c of serverState.connections) if (c.isOpen()) c.drop()
+    },
+    /** Make every open connection stop answering (a black-holed transport). */
+    goSilent: () => {
+      for (const c of serverState.connections) if (c.isOpen()) c.goSilent()
+    },
+    /** Make every connection answer again (lifts goSilent). */
+    resume: () => {
+      for (const c of serverState.connections) c.resume()
+    },
   }
 }
