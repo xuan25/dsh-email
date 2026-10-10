@@ -10,8 +10,9 @@
 // (no cordis timer service), ctx.get soft reads for the agents /
 // dshHomePath services (no static inject additions), and the
 // deployment-default model route (no per-session model knob), and an
-// explicit meta.cwd (the harness home's trigger-runs directory, the
-// framework's no-cwd default dies before the first LLM call) plus
+// explicit meta.cwd (the harness home's plugin-specific dsh-email
+// directory, the framework's no-cwd default dies before the first LLM
+// call) plus
 // meta.agentPreset, mirroring the other in-process session creators. The
 // sandbox policy stays the host default; a trigger session is never
 // cancelled on watcher dispose (it is detached and settles on its own).
@@ -55,7 +56,7 @@ const DEFAULT_MODEL_SETTINGS_NAMESPACE = 'agent-default-model'
  * in-process plugin dispatches (the first turn dies before any LLM call),
  * so the dispatcher always creates a session with an explicit workspace.
  */
-const TRIGGER_WORKSPACE_DIR = 'trigger-runs'
+const TRIGGER_WORKSPACE_DIR = 'dsh-email'
 
 /** The connect / watch lifecycle states of one watcher. */
 type WatchState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'terminal' | 'disposed'
@@ -286,7 +287,7 @@ async function resolvePreset(
 
 /**
  * Prepare the trigger sessions' shared workspace under the harness home
- * ($DSH_HOME/trigger-runs) and return its path for meta.cwd. Every failure
+ * ($DSH_HOME/dsh-email) and return its path for meta.cwd. Every failure
  * is soft: without the dshHomePath service (or on a mkdir failure) the
  * dispatcher degrades to a workspace-less create and warns.
  */

@@ -2700,7 +2700,8 @@ async function withServer(start, fn) {
   }, { folders: { INBOX: { messages: [] } } })
 
   // -- W11d: workspace meta (root-cause fix): the dshHomePath service yields
-  //        the trigger-runs workspace as meta.cwd (the directory is created),
+  //        the plugin-specific dsh-email workspace as meta.cwd (the
+  //        directory is created),
   //        and the mounted deployment-default preset lands in meta.agentPreset
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
@@ -2718,8 +2719,8 @@ async function withServer(start, fn) {
       })
       ok('W11d: the workspace-aware dispatch creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
       const c = agents.creates[0]
-      eq('W11d: meta.cwd is the harness-home trigger-runs directory', c.meta?.cwd, path.join(home, 'trigger-runs'))
-      ok('W11d: the workspace directory was created', existsSync(path.join(home, 'trigger-runs')))
+      eq('W11d: meta.cwd is the harness-home dsh-email directory', c.meta?.cwd, path.join(home, 'dsh-email'))
+      ok('W11d: the workspace directory was created', existsSync(path.join(home, 'dsh-email')))
       eq('W11d: the mounted deployment-default preset is recorded in meta.agentPreset', c.meta?.agentPreset, 'dep-default')
       eq('W11d: the preset was mounted', presets.mounted.join(','), 'dep-default')
       ok('W11d: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
@@ -2731,12 +2732,12 @@ async function withServer(start, fn) {
   }, { folders: { INBOX: { messages: [] } } })
 
   // -- W11e: dshHomePath service present but the mkdir fails (the
-  //        trigger-runs path exists as a file): the dispatcher warns and
+  //        dsh-email path exists as a file): the dispatcher warns and
   //        degrades to a workspace-less create (the session still runs)
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
     const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-home-'))
-    writeFileSync(path.join(home, 'trigger-runs'), 'x')
+    writeFileSync(path.join(home, 'dsh-email'), 'x')
     try {
       const agents = makeAgentsService({ turnEnd: 'completed' })
       const { watcher, state } = startTriggerWatcher(srv, {
