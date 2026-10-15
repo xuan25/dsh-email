@@ -421,14 +421,14 @@ function envOne(name, o = {}) {
  * ctx.effect runs the execute callback immediately and keeps the returned
  * disposer in state.effects so a test can dispose registered effects. */
 function fakeCtx(services = {}) {
-  const state = { tools: [], providers: [], sections: [], provided: [], warns: [], errors: [], infos: [], effects: [] }
+  const state = { tools: [], providers: [], sections: [], provided: [], warns: [], errors: [], infos: [], debugs: [], effects: [] }
   const ctx = {
     reflect: { provide: (name) => { state.provided.push(name) } },
     logger: () => ({
       warn: (m) => state.warns.push(m),
       error: (m) => state.errors.push(m),
       info: (m) => state.infos.push(m),
-      debug() {},
+      debug: (m) => state.debugs.push(m),
     }),
     tools: { register: (t) => { state.tools.push(t); return () => {} } },
     skills: { registerProvider: (p) => { state.providers.push(p); return () => {} } },
@@ -3800,7 +3800,7 @@ async function withServer(start, fn) {
       mkdirSync(storeRoot)
       const { sweeper, state } = makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() } })
       sweeper.start()
-      ok('arming-a: start arms an immediate first round', await waitFor(() => state.infos.some((m) => m.includes('sweep done')), 2000))
+      ok('arming-a: start arms an immediate first round (the no-op round logs at debug)', await waitFor(() => state.debugs.some((m) => m.includes('sweep done')), 2000))
       sweeper.start() // re-arming is a no-op
       sweeper.dispose()
       ok('arming-a: dispose stops the timer without error', true)

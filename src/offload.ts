@@ -572,13 +572,21 @@ export class OffloadSweeper {
       )
     }
 
-    // 5. Round summary line.
-    logger.info(
+    // 5. Round summary line: a no-op round (nothing offloaded, no errors) is
+    //    a heartbeat, not an event - it logs at debug, where a sink that
+    //    excludes debug keeps it out of the visible stream; a round that
+    //    archived a session or hit a rename error logs at info as the
+    //    operator-visible evidence that the offload plane acted.
+    const summary =
       `${tag}: sweep done (candidates ${report.candidates}, offloaded ${report.offloaded}, ` +
-        `already archived ${report.alreadyArchived}, source gone ${report.sourceGone}, ` +
-        `still live ${report.skippedLive}, errors ${report.errors}, ` +
-        `log lines removed ${report.removedLines}, balance ${report.balance})`,
-    )
+      `already archived ${report.alreadyArchived}, source gone ${report.sourceGone}, ` +
+      `still live ${report.skippedLive}, errors ${report.errors}, ` +
+      `log lines removed ${report.removedLines}, balance ${report.balance})`
+    if (report.offloaded > 0 || report.errors > 0) {
+      logger.info(summary)
+    } else {
+      logger.debug(summary)
+    }
     return report
   }
 
