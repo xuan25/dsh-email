@@ -11,16 +11,24 @@
 // one-line system-prompt pointer; with the v1.9 new-mail trigger it also
 // starts one per-account trigger watcher (a resident IMAP connection that
 // dispatches a fresh agent session per new mail) as a fiber effect for each
-// trigger-enabled account. The watcher services agents / agentPresets /
-// dshHomePath are SOFT reads (ctx.get, never inject): a host without them
-// degrades to a visible warning and no watcher.
+// trigger-enabled account; with the v2.0 session offload it also starts one
+// per-minute sweep (a fiber effect, independent of the watchers) that moves
+// settled trigger sessions outliving their account's retention window
+// (EMAIL_<N>_SESSION_RETENTION, env-only) into the archive under the plugin
+// home. The watcher and offload services agents / agentPresets / dshHomePath
+// / sessionPersistence / sessions are SOFT reads (ctx.get, never inject): a
+// host without them degrades to a visible warning and no watcher / a
+// disabled sweep.
+import path from 'node:path'
+
 import Schema from '@deepseek-ai/schemastery'
 import { Service, type Context } from '@deepseek-ai/cordis'
-import { PLUGIN_NAME } from './util.js'
+import { OFFLOAD_ARCHIVE_DIR, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE, OFFLOAD_STORE_ROOT, OffloadSweeper, appendRetentionEntry } from './offload.js'
+import { PLUGIN_NAME, errMsg } from './util.js'
 import { foldConfig, NAME_RE, type DeliveredConfig } from './config.js'
 import { registerTool } from './tool.js'
 import { registerSkill } from './skill.js'
-import { MailWatcher } from './watch.js'
+import { MailWatcher, type RetentionRecord, type RetentionRecorder } from './watch.js'
 
 /** The TLS-mode field: the three mode words, matched case-insensitively (the env contract does the same). */
 function tlsModeField(): Schema {
@@ -179,6 +187,50 @@ export class DshEmailPlugin extends Service {
         'Read and send mail through configured IMAP/SMTP accounts with the email tool; ' +
         'see the dsh-email skill for the verb reference, the EMAIL_* env contract, and limits.',
     })
+    // v2.0: session offload (the retention plane). The shared in-flight set
+    // (created-not-settled trigger session ids) is owned by the plugin and
+    // handed to every trigger watcher; the per-minute sweeper (one fiber
+    // effect, independent of the watchers) moves settled trigger sessions
+    // that outlived their account's retention window into the archive under
+    // the plugin home. Without the dshHomePath service the layout is
+    // unresolvable and the component is disabled with a warning (trigger
+    // dispatches are unaffected).
+    const inflight = new Set<string>()
+    let dshHome: ((p: string) => string) | undefined
+    try {
+      const h = ctx.get('dshHomePath')
+      dshHome = typeof h === 'function' ? (h as (p: string) => string) : undefined
+    } catch {
+      dshHome = undefined
+    }
+    if (dshHome === undefined) {
+      logger.warn('the dshHomePath service is unreachable; the session offload component is disabled (trigger dispatches are unaffected)')
+    } else {
+      const homeBase = dshHome(OFFLOAD_HOME_BASE)
+      const sweeper = new OffloadSweeper({
+        ctx,
+        logger,
+        home: {
+          base: homeBase,
+          archive: path.join(homeBase, OFFLOAD_ARCHIVE_DIR),
+          log: path.join(homeBase, OFFLOAD_LOG_FILE),
+          storeRoot: dshHome(OFFLOAD_STORE_ROOT),
+        },
+        accounts: new Map(cfg.accounts.map((a) => [a.name, a.sessionRetentionMs])),
+        inflight,
+        cap: cfg.offloadBatch,
+      })
+      ctx.effect(
+        () => {
+          sweeper.start()
+          return (): void => {
+            sweeper.dispose()
+          }
+        },
+        'dsh-email offload sweep',
+      )
+    }
+
     // v1.9: start the per-account new-mail trigger watchers (one fiber
     // effect each). A malformed trigger configuration warns and starts no
     // watcher (the account stays fully usable through every mail verb); an
@@ -212,9 +264,28 @@ export class DshEmailPlugin extends Service {
       }
       if (acct.trigger.kind !== 'on' || !hasAgents) continue
       const trigger = acct.trigger.config
+      // The retention write gate: a recorder is attached only for accounts
+      // whose retention window is enabled (non-zero); the sweep is the only
+      // other writer of the log. A failed append warns (the session stays
+      // dispatched but untracked).
+      const retention: RetentionRecorder | undefined =
+        dshHome !== undefined && acct.sessionRetentionMs > 0
+          ? {
+              record: (entry: RetentionRecord): void => {
+                void appendRetentionEntry(path.join(dshHome(OFFLOAD_HOME_BASE), OFFLOAD_LOG_FILE), {
+                  id: entry.id,
+                  createdAt: entry.createdAt,
+                  unit: acct.name,
+                  ...(entry.cwd !== undefined ? { cwd: entry.cwd } : {}),
+                }).catch((err: unknown) => {
+                  logger.warn(`account "${acct.name}": the retention log write for session ${entry.id} failed (${errMsg(err)}); the session continues untracked`)
+                })
+              },
+            }
+          : undefined
       ctx.effect(
         () => {
-          const watcher = new MailWatcher({ ctx, account: acct, trigger })
+          const watcher = new MailWatcher({ ctx, account: acct, trigger, inflight, retention })
           watcher.start()
           return (): void => {
             watcher.dispose()

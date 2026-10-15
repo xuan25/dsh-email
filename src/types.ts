@@ -105,6 +105,16 @@ export interface AccountConfig {
    * fields did not validate, no watcher starts, the account is unaffected.
    */
   trigger: TriggerState
+  /**
+   * The resolved per-account offload retention window in milliseconds
+   * (env-only: EMAIL_<N>_SESSION_RETENTION, no config-layer twin). 0 = no
+   * automatic offload (the default): dispatched sessions are retained
+   * forever (until a non-zero window re-manages them). A non-zero window is
+   * measured from the dispatch time; offload duty moves a settled session
+   * to the archive, and a session whose account is removed is offloaded
+   * immediately regardless of age.
+   */
+  sessionRetentionMs: number
 }
 
 /** The parsed EMAIL_* contract (read once at plugin boot). */
@@ -112,6 +122,8 @@ export interface EmailConfig {
   accounts: AccountConfig[]
   /** Body truncation budget for the read verb, in characters. */
   readBodyLimit: number
+  /** Per-sweep offload budget (EMAIL_OFFLOAD_BATCH, default 50). */
+  offloadBatch: number
 }
 
 /**

@@ -22,6 +22,7 @@
 // same rule as env. Layer composition (which patch layer wins, no deep merge)
 // is cordis semantics: the plugin sees only the one object the loader delivers.
 import { errMsg } from './util.js'
+import { DEFAULT_OFFLOAD_BATCH, parseWindowMs } from './offload.js'
 
 import type { AccountConfig, EmailConfig, TlsEndpoint, TlsMode, TriggerState } from './types.js'
 
@@ -46,6 +47,7 @@ const FIELDS = new Set([
   'SENT_FOLDER_AUTOCREATE',
   'ALLOW_DELETE',
   'TIMEOUT_MS',
+  'SESSION_RETENTION',
   'TRIGGER_ENABLE',
   'TRIGGER_PROMPT',
   'TRIGGER_FOLDER',
@@ -308,13 +310,23 @@ export function parseEnv(env: Record<string, string | undefined>, warn: (msg: st
   // (a name segment that is a letter followed by letters and digits only,
   // case-insensitive) are not recognized as account variables; a warning
   // names the offending key so a mistyped variable is visible at boot.
-  const GLOBAL_KEYS = new Set(['EMAIL_DEFAULT_ACCOUNT', 'EMAIL_READ_BODY_LIMIT'])
+  const GLOBAL_KEYS = new Set(['EMAIL_DEFAULT_ACCOUNT', 'EMAIL_READ_BODY_LIMIT', 'EMAIL_OFFLOAD_BATCH'])
   const ACCOUNT_LIKE_RE = /^EMAIL_([A-Za-z0-9-]+)_[A-Z][A-Z_]*$/
   for (const key of Object.keys(env)) {
     if (GLOBAL_KEYS.has(key) || ACCOUNT_VAR_RE.test(key)) continue
     const m = ACCOUNT_LIKE_RE.exec(key)
     if (!m) continue
     warn(`EMAIL_ variable "${key}" is not recognized as an account declaration: the name segment "${m[1].toLowerCase()}" must be a letter followed by letters and digits only (case-insensitive)`)
+  }
+
+  let offloadBatch = DEFAULT_OFFLOAD_BATCH
+  if (env.EMAIL_OFFLOAD_BATCH !== undefined) {
+    const n = parseIntBounded(env.EMAIL_OFFLOAD_BATCH, 1, Number.MAX_SAFE_INTEGER)
+    if (n === undefined) {
+      warn(`EMAIL_OFFLOAD_BATCH "${env.EMAIL_OFFLOAD_BATCH}" is not a positive integer; using the default ${DEFAULT_OFFLOAD_BATCH}`)
+    } else {
+      offloadBatch = n
+    }
   }
 
   const accounts: AccountConfig[] = []
@@ -333,11 +345,23 @@ export function parseEnv(env: Record<string, string | undefined>, warn: (msg: st
       warn(`account "${e.name}" dropped: ${acc.error}`)
       continue
     }
+    // SESSION_RETENTION (env-only, the config layer opens no twin): the
+    // per-account offload retention window. An invalid value warns and
+    // resolves to 0 (no automatic offload) - it never drops the account.
+    const retRaw = e.fields.SESSION_RETENTION
+    if (retRaw !== undefined) {
+      const parsed = parseWindowMs(retRaw)
+      if (parsed.ok) {
+        acc.account.sessionRetentionMs = parsed.ms
+      } else {
+        warn(`account "${e.name}": SESSION_RETENTION "${retRaw}" is not a valid retention window (${parsed.reason}); the window is treated as 0 (no automatic offload)`)
+      }
+    }
     const defaultLower = defaultName === null ? null : defaultName.toLowerCase()
     acc.account.isDefault = defaultLower !== null && defaultLower === e.name
     accounts.push(acc.account)
   }
-  return { accounts, readBodyLimit }
+  return { accounts, readBodyLimit, offloadBatch }
 }
 
 /**
@@ -478,6 +502,7 @@ function buildAccount(e: RawAccount, valid: boolean): { account: AccountConfig }
     allowDelete: false,
     isDefault: false,
     trigger: parseTriggerFields(e.triggerRaw),
+    sessionRetentionMs: 0,
   }
   if (f.FROM_NAME !== undefined && f.FROM_NAME.trim() !== '') account.fromName = f.FROM_NAME.trim()
   if (f.SENT_FOLDER !== undefined && f.SENT_FOLDER.trim() !== '') account.sentFolder = f.SENT_FOLDER.trim()

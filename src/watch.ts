@@ -42,7 +42,7 @@ const BACKOFF_BASE_MS = 5_000
 const BACKOFF_MAX_MS = 60_000
 /**
  * Settings-document namespace holding the deployment's default model selection
- * — the same canonical store the framework's agent-default-model service is
+ * - the same canonical store the framework's agent-default-model service is
  * built on. The literal mirrors the constant the owning package exports; the
  * package is spelled out locally because it is not a dependency of this plugin.
  */
@@ -50,13 +50,16 @@ const DEFAULT_MODEL_SETTINGS_NAMESPACE = 'agent-default-model'
 
 /**
  * Sub-directory of the harness home that hosts the trigger sessions'
- * workspace (meta.cwd). Every other in-process session creator in a
- * deployment (timer jobs, the qqbot session manager) passes an explicit
- * meta.cwd; the framework's no-cwd default has proven broken for
- * in-process plugin dispatches (the first turn dies before any LLM call),
- * so the dispatcher always creates a session with an explicit workspace.
+ * workspace (meta.cwd), named after the plugin ($DSH_HOME/dsh-email) so
+ * the directory's ownership is unambiguous. Every other in-process
+ * session creator in a deployment (timer jobs, the qqbot session
+ * manager) passes an explicit meta.cwd; the framework's no-cwd default
+ * has proven broken for in-process plugin dispatches (the first turn
+ * dies before any LLM call), so the dispatcher always creates a session
+ * with an explicit workspace.
  */
-const TRIGGER_WORKSPACE_DIR = 'dsh-email'
+/** The trigger sessions' shared workspace under the harness home (the session offload's layout nests here). */
+const TRIGGER_WORKSPACE_DIR = 'dsh-email/workspace'
 
 /** The connect / watch lifecycle states of one watcher. */
 type WatchState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'terminal' | 'disposed'
@@ -72,6 +75,21 @@ export interface DispatchOwner {
 }
 
 /** Everything one trigger session dispatch needs. */
+/** One retention log record (the write gate applies at dispatch time). */
+export interface RetentionRecord {
+  id: string
+  /** Dispatch time (ISO8601); the retention window is measured from it. */
+  createdAt: string
+  /** Session workspace at create time (absent when the create carried no meta.cwd). */
+  cwd?: string
+}
+
+/** The retention log write seam (attached per account only when the retention window is enabled). */
+export type RetentionRecorder = { record(entry: RetentionRecord): void }
+
+/** The in-flight session id tracking seam (the offload sweep's liveness input). */
+export type InflightTracker = { add(id: string): void; remove(id: string): void }
+
 export interface DispatchParams {
   ctx: Context
   logger: Logger
@@ -81,6 +99,10 @@ export interface DispatchParams {
   /** The fully rendered three-part prompt (envelope line filled by the watcher). */
   prompt: string
   owner: DispatchOwner
+  /** Register the created session id as in-flight until settlement (offload liveness). */
+  inflight?: InflightTracker
+  /** Record the created session in the retention log (offload write gate). */
+  retention?: RetentionRecorder
 }
 
 /** The dispatch outcome: ok, or a visible failure (the uid stays UNSEEN). */
@@ -97,6 +119,10 @@ export interface MailWatcherOptions {
   createConnection?: (account: AccountConfig) => ImapFlow
   /** Test seam: trigger session factory (default = the production dispatcher). */
   createSession?: CreateSessionFn
+  /** Shared in-flight session id set (plugin-owned; the offload sweep reads it). */
+  inflight?: Set<string>
+  /** Retention log write seam (attached only when the account's retention window is enabled). */
+  retention?: RetentionRecorder
 }
 
 /** The live-agent runtime face the dispatcher drives (followup / settle / cancel / snapshot). */
@@ -182,7 +208,7 @@ function normalizeDefaultSelection(value: unknown): DefaultModelSelection | unde
 
 /**
  * Read the deployment's default model selection, trying three SOFT sources in
- * order — none of them is a required inject, so a host providing none of
+ * order - none of them is a required inject, so a host providing none of
  * them simply has no default route (a route-less session's first turn
  * rejects and the failure is surfaced at settlement). Ports the dsh-timer
  * runner's soft sources with one declared deviation (2): the harness home
@@ -210,7 +236,7 @@ async function readDefaultModelSelection(ctx: Context): Promise<DefaultModelSele
 }
 
 /**
- * The model route of the trigger session: no per-session model knob exists —
+ * The model route of the trigger session: no per-session model knob exists -
  * the deployment's default selection from the soft sources above when one
  * resolves; otherwise no route is passed and the framework's own no-route
  * rejection is surfaced at settlement.
@@ -362,7 +388,7 @@ function accountTag(name: string): string {
 async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult> {
   const { ctx, logger, account, trigger, uid, prompt, owner } = p
 
-  // The agents service: soft read (deviation 3 — no static inject).
+  // The agents service: soft read (deviation 3 - no static inject).
   const agents: AgentsService | undefined = (() => {
     try {
       const s = ctx.get('agents')
@@ -389,7 +415,7 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
   if (workspace !== undefined) meta.cwd = workspace
   if (preset.id !== undefined) meta.agentPreset = preset.id
 
-  // Bounded create: a host setTimeout (deviation 1 — the watcher does not
+  // Bounded create: a host setTimeout (deviation 1 - the watcher does not
   // depend on a cordis timer service) tracked on the owner so watcher
   // dispose cancels it; a create resolving late after a cancelled deadline
   // self-disposes at settlement (the factory owns its handle).
@@ -404,8 +430,9 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
       /* timer already fired */
     }
   }
+  const sessionId = randomUUID() as SessionId
   const createPromise = agents.create({
-    sessionId: randomUUID() as SessionId,
+    sessionId,
     ...(Object.keys(meta).length > 0 ? { meta } : {}),
     ...(Object.keys(agentOptions).length > 0 ? { agentOptions } : {}),
     ...(preset.setup ? { setup: preset.setup } : {}),
@@ -454,6 +481,21 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
   }
   const created = createResult.handle
 
+  // Offload hooks: mark the session in-flight (until settlement) and record
+  // it in the retention log (the write gate applied at the point the plugin
+  // attached the recorder). A failed log write warns and continues with an
+  // untracked session (the dispatch itself is unaffected).
+  p.inflight?.add(sessionId)
+  try {
+    p.retention?.record({
+      id: sessionId,
+      createdAt: new Date().toISOString(),
+      ...(workspace !== undefined ? { cwd: workspace } : {}),
+    })
+  } catch (err) {
+    logger.warn(`${accountTag(account.name)}: the retention log write for session ${sessionId} failed (${errMsg(err)}); the session continues untracked`)
+  }
+
   // The first turn: the three-part prompt (envelope line rendered by the watcher).
   const msg = createUserMessage({
     content: [{ type: 'text', text: prompt }],
@@ -501,13 +543,14 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
   } catch {
     /* already disposed */
   }
+  p.inflight?.remove(sessionId)
   return outcome
 }
 
 /**
  * The per-account new-mail trigger watcher. One resident IMAP connection
  * (EXAMINE on the listened folder, auto-IDLE on); new mail reaches it two
- * ways — the client-level 'exists' event (untagged EXISTS from the
+ * ways - the client-level 'exists' event (untagged EXISTS from the
  * always-running socket reader) and the heartbeat resync (the sole repair
  * for a lost event / count drift, and the half-open black-hole probe).
  * Detection triggers the same action: a UNSEEN search (server/uid order)
@@ -795,7 +838,7 @@ export class MailWatcher implements DispatchOwner {
       // prefix), folder, the overflowed uids, and the overflow count.
       this.logger.warn(
         `${this.logTag()}: trigger queue full (folder "${this.trigger.folder}", ${this.trigger.queueMax} waiting, ` +
-          `${this.active.size} active): ${overflow.length} uid(s) overflowed — uid ${overflow.join(', ')} ` +
+          `${this.active.size} active): ${overflow.length} uid(s) overflowed - uid ${overflow.join(', ')} ` +
           'stay UNSEEN and are retried on the next resync',
       )
     }
@@ -831,6 +874,7 @@ export class MailWatcher implements DispatchOwner {
         subject: env.subject,
         policy: this.trigger.prompt,
       })
+      const inflight = this.options.inflight
       result = await this.createSession({
         ctx: this.options.ctx,
         logger: this.logger,
@@ -839,6 +883,19 @@ export class MailWatcher implements DispatchOwner {
         uid,
         prompt,
         owner: this,
+        ...(inflight !== undefined
+          ? {
+              inflight: {
+                add: (id: string) => {
+                  inflight.add(id)
+                },
+                remove: (id: string) => {
+                  inflight.delete(id)
+                },
+              },
+            }
+          : {}),
+        ...(this.options.retention !== undefined ? { retention: this.options.retention } : {}),
       })
     } catch (err) {
       // The uniform failure rule: any watcher command failure (including the
@@ -846,7 +903,7 @@ export class MailWatcher implements DispatchOwner {
       // on the next connect; the uid stays UNSEEN. Routed through the
       // state-guarded uniform failure path so this path is mutually
       // exclusive with the close / error events of the same transport
-      // failure — at most one backoff per failure.
+      // failure - at most one backoff per failure.
       void this.reconnectAfterFailure(`command failed: ${errMsg(err)}`)
       return
     }

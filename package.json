@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/",
+    "lint": "eslint src/ test/",
     "selftest": "node test/selftest.mjs"
   },
   "dependencies": {

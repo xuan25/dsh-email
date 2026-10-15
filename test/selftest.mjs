@@ -10,7 +10,7 @@
 // like its env counterpart), plugin/skill assembly, and the shipped-hygiene
 // guards.
 // Run with: node --test test/   (or: node test/selftest.mjs)
-import { readdirSync, readFileSync, existsSync, statSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync, statSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, renameSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -49,6 +49,22 @@ const { RAW_HEADERS_LIMIT, RAW_HEADERS_TRUNCATED, presentRawHeaders, quoteText }
 const { DEFAULT_SAVE_DIR, sanitizeFilename } = await import(path.join(PKG, 'lib', 'save.js'))
 const { DshEmailPlugin } = await import(path.join(PKG, 'lib', 'index.js'))
 const { MailWatcher } = await import(path.join(PKG, 'lib', 'watch.js'))
+// The module namespace is kept so tests can set the exported `rewriteBarrier`
+// test seam (a live export-let binding).
+const offload = await import(path.join(PKG, 'lib', 'offload.js'))
+const {
+  COMPACTION_RATIO,
+  DEFAULT_OFFLOAD_BATCH,
+  OFFLOAD_ARCHIVE_DIR,
+  OFFLOAD_HOME_BASE,
+  OFFLOAD_LOG_FILE,
+  OFFLOAD_STORE_ROOT,
+  OffloadSweeper,
+  appendRetentionEntry,
+  parseWindowMs,
+  readRetentionLog,
+  rewriteRetentionLog,
+} = offload
 const { buildWatcherConnection } = await import(path.join(PKG, 'lib', 'imap-client.js'))
 const { startImapServer, makeMessage } = await import(path.join(PKG, 'test', 'fake-imap.mjs'))
 const { startSmtpServer } = await import(path.join(PKG, 'test', 'fake-smtp.mjs'))
@@ -306,7 +322,7 @@ function charsetMessages() {
       subject: 'Charset iso',
       messageId: '<mc2@example.com>',
       rawHeaders: head(2, 'Charset iso', 'latin1@example.com', 'Content-Type: text/html; charset=iso-8859-1\r\nContent-Transfer-Encoding: 7bit\r\n'),
-      parts: { type: 'text/html', charset: 'iso-8859-1', cte: '7bit', body: Buffer.from('café', 'latin1').toString('latin1') },
+      parts: { type: 'text/html', charset: 'iso-8859-1', cte: '7bit', body: Buffer.from('caf\u00e9', 'latin1').toString('latin1') },
     }),
     makeMessage({
       uid: 3,
@@ -364,6 +380,7 @@ function envOne(name, o = {}) {
     allowDelete,
     timeout,
     trigger,
+    sessionRetention,
   } = o
   const env = {
     [`EMAIL_${name}_USER`]: 'agent',
@@ -383,6 +400,7 @@ function envOne(name, o = {}) {
   if (sentFolderAutocreate !== undefined) env[`EMAIL_${name}_SENT_FOLDER_AUTOCREATE`] = String(sentFolderAutocreate)
   if (allowDelete !== undefined) env[`EMAIL_${name}_ALLOW_DELETE`] = String(allowDelete)
   if (timeout) env[`EMAIL_${name}_TIMEOUT_MS`] = String(timeout)
+  if (sessionRetention) env[`EMAIL_${name}_SESSION_RETENTION`] = String(sessionRetention)
   if (trigger) {
     if (trigger.enable !== undefined) env[`EMAIL_${name}_TRIGGER_ENABLE`] = String(trigger.enable)
     if (trigger.prompt !== undefined) env[`EMAIL_${name}_TRIGGER_PROMPT`] = trigger.prompt
@@ -517,12 +535,24 @@ function makeSessionStub() {
  *  error message) after the followup the dispatcher sends. */
 function makeAgentsService(spec = {}) {
   const creates = []
+  // The most recent create's observation face (settleNext pushes the turn
+  // end and wakes a hung whenIdle, so a `hang` session can settle on demand).
+  let last = null
   return {
     creates,
+    settleNext: (reason = 'completed') => {
+      if (!last) return false
+      last.events.push({ type: 'turn/end', data: { reason } })
+      last.idleResolver.r?.()
+      return true
+    },
     create: async (options) => {
       creates.push(options)
       if (spec.createReject) throw new Error(spec.createReject)
       const events = []
+      // A mutable box (a bare value on `last` would snapshot the null at
+      // create time; the resolver lands when the dispatch awaits whenIdle).
+      last = { events, idleResolver: { r: null } }
       const agent = {
         followup: (msg) => {
           if (spec.followupReject) return Promise.reject(new Error(spec.followupReject))
@@ -530,7 +560,7 @@ function makeAgentsService(spec = {}) {
           if (spec.turnEnd !== undefined) events.push({ type: 'turn/end', data: { reason: spec.turnEnd } })
           return Promise.resolve()
         },
-        whenIdle: () => sleep(0),
+        whenIdle: () => (spec.hang ? new Promise((r) => { last.idleResolver.r = r }) : sleep(0)),
         cancel: () => {},
         session: { snapshotEvents: () => events },
       }
@@ -586,12 +616,17 @@ function makePresetsService(spec = {}) {
  * servers without the IDLE capability). `services` seeds ctx.get,
  * `createSession` overrides the session factory (default: the production
  * dispatcher, which then consumes the services). */
-function startTriggerWatcher(srv, { name = 'main', trigger, timeout, services = {}, createSession, autoIdleDelay } = {}) {
+function startTriggerWatcher(
+  srv,
+  { name = 'main', trigger, timeout, services = {}, createSession, autoIdleDelay, inflight, retention } = {},
+) {
   const env = envOne(name, { imapPort: srv.port, smtpPort: 1, timeout, trigger })
   const cfg = parseEnv(env, () => {})
   const acct = cfg.accounts[0]
   const { ctx, state } = fakeCtx(services)
   const opts = { ctx, account: acct, trigger: acct.trigger.config }
+  if (inflight !== undefined) opts.inflight = inflight
+  if (retention !== undefined) opts.retention = retention
   if (autoIdleDelay !== undefined) {
     const extra = { autoIdleDelay }
     opts.createConnection = (a) => buildWatcherConnection(a, extra).client
@@ -1748,7 +1783,9 @@ async function withServer(start, fn) {
   new DshEmailPlugin(ctx, {})
   let want = 0
   parseEnv(process.env, () => { want += 1 })
-  eq('plugin: boot warnings mirror parseEnv of the real env', state.warns.length, want)
+  // The offload component warns separately when the fake ctx exposes no
+  // dshHomePath (by design); it is not a parseEnv mirror and is excluded.
+  eq('plugin: boot warnings mirror parseEnv of the real env', state.warns.filter((m) => !m.includes('offload component is disabled')).length, want)
 }
 
 // ---------------------------------------------------------------------------
@@ -1786,15 +1823,15 @@ async function withServer(start, fn) {
       (async () => {
         const d = makeDriver(envOne('main', { imapPort: srv.port, smtpPort: 1 }))
         let r = doc(await d.execute({ verb: 'read', uid: 1 }))
-        eq('charset: a windows-1252 text part reads back transcoded', [r.body.kind, r.body.text], ['text', 'Žošté'])
+        eq('charset: a windows-1252 text part reads back transcoded', [r.body.kind, r.body.text], ['text', '\u017do\u0161t\u00e9'])
         r = doc(await d.execute({ verb: 'read', uid: 2 }))
-        eq('charset: an iso-8859-1 html part reads back transcoded', [r.body.kind, r.body.text], ['html', 'café'])
+        eq('charset: an iso-8859-1 html part reads back transcoded', [r.body.kind, r.body.text], ['html', 'caf\u00e9'])
         r = doc(await d.execute({ verb: 'read', uid: 3 }))
         eq('charset: an unknown charset arrives as stored bytes (utf-8 fallback)', r.body.text, 'caf\uFFFD')
         const dest = path.join(os.tmpdir(), `dsh-email-selftest-cs-${process.pid}-${Date.now()}.txt`)
         r = doc(await d.execute({ verb: 'save_part', uid: 1, part: 0, path: dest }))
         ok('charset: save_part reports the explicit destination', r && r.path === dest, r)
-        eq('charset: the saved part holds the transcoded bytes', readFileSync(dest, 'utf8'), 'Žošté')
+        eq('charset: the saved part holds the transcoded bytes', readFileSync(dest, 'utf8'), '\u017do\u0161t\u00e9')
         try {
           rmSync(dest)
         } catch {
@@ -2295,7 +2332,9 @@ async function withServer(start, fn) {
       Object.assign(process.env, { ...upper, EMAIL_DEFAULT_ACCOUNT: 'default' })
       const { ctx, state } = fakeCtx()
       new DshEmailPlugin(ctx, { readBodyLimit: 500, accounts: { default: { imapPort: 1234 } } })
-      ok('assembly: a valid layer produces no boot warnings', state.warns.length === 0, state.warns)
+      // The offload component warns separately without a dshHomePath service
+      // (by design); it is not a config-layer warning and is excluded.
+      ok('assembly: a valid layer produces no boot warnings', state.warns.filter((m) => !m.includes('offload component is disabled')).length === 0, state.warns)
       const out = doc(await state.tools[0].execute({ verb: 'accounts' }))
       eq('assembly: the folded layer is visible in the accounts verb', [out.default, out.accounts[0].imap.port, out.accounts[0].smtp.port], ['default', 1234, 1])
       ok('assembly: the accounts presentation keeps its shape (no source annotations)', out.accounts.every((a) => Object.keys(a).every((k) => ['name', 'user', 'from', 'imap', 'smtp', 'sentFolder', 'sentFolderAutocreate', 'allowDelete', 'isDefault'].includes(k))), out.accounts)
@@ -2334,6 +2373,34 @@ async function withServer(start, fn) {
     }
   }
   walk(PKG)
+}
+{
+  // Strict ASCII gate (independent assertion section; the CJK-subset regexes
+  // above are extra pattern checks, not this gate). Every shipped file in the
+  // tree - src, test, lib, README, manifest, patch, toolchain config, skill -
+  // must be pure ASCII: any codepoint above U+007F fails the selftest.
+  const strictFiles = []
+  const strictSkip = new Set(['.git', 'node_modules', '.selftest-tmp'])
+  const collect = (dir) => {
+    for (const e of readdirSync(dir)) {
+      if (strictSkip.has(e)) continue
+      const p = path.join(dir, e)
+      const st = statSync(p)
+      if (st.isDirectory()) collect(p)
+      else strictFiles.push(path.relative(PKG, p))
+    }
+  }
+  collect(PKG)
+  ok('strict ascii: the shipped tree is non-empty', strictFiles.length > 20, strictFiles.length)
+  for (const f of strictFiles) {
+    const src = readFileSync(path.join(PKG, f), 'utf8')
+    const m = /[^\u0000-\u007f]/.exec(src)
+    ok(
+      `strict ascii: ${f} carries no codepoint above U+007F`,
+      m === null,
+      m === null ? undefined : `${f}: line ${src.slice(0, m.index).split('\n').length} codepoint U+${m[0].codePointAt(0).toString(16)}`,
+    )
+  }
 }
 {
   const manifest = JSON.parse(readFileSync(path.join(PKG, 'package.json'), 'utf8'))
@@ -2522,7 +2589,7 @@ async function withServer(start, fn) {
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
     const stub = makeSessionStub()
-    const { watcher, state } = startTriggerWatcher(srv, {
+    const { watcher } = startTriggerWatcher(srv, {
       trigger: { enable: true, prompt: 'P', idleMs: 1000 },
       createSession: stub.fn,
     })
@@ -2589,7 +2656,7 @@ async function withServer(start, fn) {
       eq('W9: no trigger effect is registered', state.effects.length, 0)
       await sleep(700)
       eq('W9: zero IMAP connections for a trigger-free account', srv.state.openSockets.length, 0)
-      eq('W9: no trigger warning is logged', state.warns.filter((m) => m.includes('trigger')).length, 0)
+      eq('W9: no trigger warning is logged', state.warns.filter((m) => m.includes('trigger') && !m.includes('offload component is disabled')).length, 0)
       for (const e of state.effects) e.dispose()
     })
   }, { folders: { INBOX: { messages: [] } } })
@@ -2681,7 +2748,7 @@ async function withServer(start, fn) {
     watcher.dispose()
   }, { folders: { INBOX: { messages: [] } } })
 
-  // -- W11c: unnamed preset → the deployment default path: no preset
+  // -- W11c: unnamed preset -> the deployment default path: no preset
   //        service and no model-route source means a bare baseline create
   //        (no setup hook, no agent options)
   await tServer(async (srv) => {
@@ -2719,8 +2786,8 @@ async function withServer(start, fn) {
       })
       ok('W11d: the workspace-aware dispatch creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
       const c = agents.creates[0]
-      eq('W11d: meta.cwd is the harness-home dsh-email directory', c.meta?.cwd, path.join(home, 'dsh-email'))
-      ok('W11d: the workspace directory was created', existsSync(path.join(home, 'dsh-email')))
+      eq('W11d: meta.cwd is the harness-home dsh-email workspace directory', c.meta?.cwd, path.join(home, 'dsh-email', 'workspace'))
+      ok('W11d: the workspace directory was created', existsSync(path.join(home, 'dsh-email', 'workspace')))
       eq('W11d: the mounted deployment-default preset is recorded in meta.agentPreset', c.meta?.agentPreset, 'dep-default')
       eq('W11d: the preset was mounted', presets.mounted.join(','), 'dep-default')
       ok('W11d: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
@@ -2812,7 +2879,7 @@ async function withServer(start, fn) {
       eq('W13: the on-account registers one trigger effect', state.effects.length, 1)
       eq('W13: the effect is labeled per account', state.effects[0].label, 'dsh-email trigger main')
       ok('W13: the watcher connects', await waitFor(() => srv.state.openSockets.length >= 1, 4000))
-      eq('W13: no warnings on a healthy fold', state.warns.length, 0)
+      eq('W13: no warnings on a healthy fold', state.warns.filter((m) => !m.includes('offload component is disabled')).length, 0)
       for (const e of state.effects) e.dispose()
     })
   }, { folders: { INBOX: { messages: [] } } })
@@ -2940,7 +3007,7 @@ async function withServer(start, fn) {
   }, { folders: { INBOX: { messages: [] } } })
 
   // -- W19b: env channel with two accounts: one malformed (a negative
-  //        queueMax) and one valid — the valid account's watcher still
+  //        queueMax) and one valid - the valid account's watcher still
   //        starts and the sibling is named in the warning
   await tServer(async (srv) => {
     const env = {
@@ -2957,6 +3024,1075 @@ async function withServer(start, fn) {
       for (const e of state.effects) e.dispose()
     })
   }, { folders: { INBOX: { messages: [] } } })
+}
+
+// ---------------------------------------------------------------------------
+// 32. session offload: retention window parser, retention log, the sweep
+//     (round health, window semantics, the source/destination existence
+//     table, liveness gate and its rollback, the budget, compaction, trend
+//     alert) and the plugin integration write gate (O1-O9)
+// ---------------------------------------------------------------------------
+{
+  // A fake sessionPersistence service: locate() mirrors the framework jsonl
+  // layout (the session dir is the dirname of the log path; a cwd-less
+  // session lives under the _no-cwd project dir).
+  function makeSpService(storeRoot) {
+    return {
+      locate: ({ id, cwd }) => ({
+        kind: 'jsonl',
+        path: path.join(storeRoot, cwd === undefined ? '_no-cwd' : path.basename(cwd), id, 'session.v4.jsonl.zstd'),
+      }),
+    }
+  }
+
+  // A fake live-session registry (the ctx.get('sessions') face; `known` is a
+  // mutable Set so a case can make a session live between two reads).
+  function makeRegistry(known) {
+    const set = known === undefined ? new Set() : known instanceof Set ? known : new Set(known)
+    return { known: set, get: (id) => (set.has(id) ? { id } : undefined) }
+  }
+
+  // Build an OffloadSweeper rooted at a temp harness home.
+  function makeSweeper(home, { storeRoot, accounts = new Map(), inflight = new Set(), cap = DEFAULT_OFFLOAD_BATCH, services = {}, now, devOf, move } = {}) {
+    const root = storeRoot ?? path.join(home, OFFLOAD_STORE_ROOT)
+    const { ctx, state } = fakeCtx(services)
+    const sweeper = new OffloadSweeper({
+      ctx,
+      logger: ctx.logger(PLUGIN_NAME),
+      home: {
+        base: path.join(home, OFFLOAD_HOME_BASE),
+        archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+        log: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE),
+        storeRoot: root,
+      },
+      accounts,
+      inflight,
+      cap,
+      ...(now !== undefined ? { now } : {}),
+      ...(devOf !== undefined ? { devOf } : {}),
+      ...(move !== undefined ? { move } : {}),
+    })
+    return { sweeper, state, storeRoot: root }
+  }
+
+  // Create a source session dir (the store side) the way the framework
+  // would, and return its path.
+  function makeSessionDir(storeRoot, id, cwd) {
+    const dir = path.join(storeRoot, cwd === undefined ? '_no-cwd' : path.basename(cwd), id)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), 'log')
+    return dir
+  }
+
+  const T0 = 1_000_000
+  // The retention log stores the dispatch time as an ISO8601 string
+  // (the frozen line format); the fixtures wrap the numeric test clocks through this.
+  const iso = (ms) => new Date(ms).toISOString()
+  const W = 60_000 // the account retention window used across the sweep cases
+  const CWD = '/ws/a' // a fake workspace; the fake persistence service keys on its basename
+  const mapMain = (ms = W) => new Map([['main', ms]])
+
+  // One round of fixtures: setup builds the home (store dir, log lines,
+  // session dirs) and returns the sweeper handles; the asserts run against
+  // the sweep report; the temp home is removed afterwards.
+  async function runCase(setup, fn) {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+    try {
+      const ctx = {
+        home,
+        storeRoot: path.join(home, OFFLOAD_STORE_ROOT),
+        logPath: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE),
+        archiveDir: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+      }
+      const handles = await setup(ctx)
+      const report = await handles.sweeper.sweep()
+      await fn({ ...ctx, report, state: handles.state })
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+
+  // -- O1: the retention window parser (number = ms; string = 1-2 segments
+  //        in descending unit order; the discriminating vectors rejected)
+  eq('O1a: number windows are non-negative integer ms', [parseWindowMs(0).ms, parseWindowMs(900000).ms], [0, 900000])
+  ok('O1a: a negative, fractional or NaN number window is invalid', !parseWindowMs(-1).ok && !parseWindowMs(1.5).ok && !parseWindowMs(Number.NaN).ok)
+  eq('O1b: one-segment duration strings', [parseWindowMs('1d').ms, parseWindowMs('24h').ms, parseWindowMs('30m').ms, parseWindowMs('90s').ms, parseWindowMs('5000ms').ms], [86_400_000, 86_400_000, 1_800_000, 90_000, 5000])
+  eq('O1b: two-segment durations in descending unit order', [parseWindowMs('1h30m').ms, parseWindowMs('4h30m').ms, parseWindowMs('1m30s').ms, parseWindowMs('1s500ms').ms], [5_400_000, 16_200_000, 90_000, 1500])
+  ok(
+    'O1c: the discriminating vectors are all invalid (strict segment grammar)',
+    ['1h30m30s', '30m4h', '1w', '1h 30m', '30', '5000', 'h', '24H', '1ms2s', '1w30m', 'banana', ''].every((v) => !parseWindowMs(v).ok),
+  )
+  ok('O1c: the range guard rejects overflow', !parseWindowMs('900000000d').ok)
+
+  // -- O2: the retention log (round trip, single append write per line, the
+  //        torn-tail repair, the bad-line skip, the atomic rewrite)
+  {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+    try {
+      const log = path.join(dir, 'sub', 'retention-log.jsonl')
+      const r0 = await readRetentionLog(log)
+      eq('O2a: reading a missing log is an empty, un-repaired read', [r0.entries.length, r0.repaired, r0.badLines], [0, false, 0])
+      await appendRetentionEntry(log, { id: 'a', createdAt: iso(1), unit: 'u1', cwd: '/x/w' })
+      await appendRetentionEntry(log, { id: 'b', createdAt: iso(2), unit: 'u2' })
+      const lines = readFileSync(log, 'utf8').split('\n')
+      eq('O2a: each append is exactly one complete line (single write per line)', lines.filter((l) => l !== '').length, 2)
+      ok('O2a: the cwd key is present for the first line and omitted for the second', lines[0].includes('"cwd":"/x/w"') && !lines[1].includes('cwd'))
+      const r1 = await readRetentionLog(log)
+      eq('O2a: the round trip preserves the entry shape and order', JSON.stringify(r1.entries), JSON.stringify([{ id: 'a', createdAt: iso(1), unit: 'u1', cwd: '/x/w' }, { id: 'b', createdAt: iso(2), unit: 'u2' }]))
+      const torn = path.join(dir, 'torn.jsonl')
+      writeFileSync(torn, `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\n{"id":"p","createdAt":"${iso(2)}","unit":"u"`)
+      const rt = await readRetentionLog(torn)
+      ok('O2b: a torn trailing line is repaired in place (back to the last newline)', rt.repaired === true && rt.entries.length === 1 && readFileSync(torn, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\n`)
+      await appendRetentionEntry(torn, { id: 'c', createdAt: iso(3), unit: 'u' })
+      ok('O2b: an append after the repair lands on its own line', readFileSync(torn, 'utf8').endsWith(`{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n`))
+      const torn2 = path.join(dir, 'torn2.jsonl')
+      writeFileSync(torn2, `{"id":"a","createdAt":"${iso(1)}","unit":"u"`) // no trailing newline
+      await appendRetentionEntry(torn2, { id: 'c', createdAt: iso(3), unit: 'u' })
+      const rt2 = await readRetentionLog(torn2)
+      ok('O2b: an append to a torn tail closes it first (the new line stays parseable)', readFileSync(torn2, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"\n{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n` && [rt2.entries.length, rt2.badLines, rt2.repaired].join() === '1,1,false')
+      const bad = path.join(dir, 'bad.jsonl')
+      writeFileSync(bad, `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\nnot json\n{"id":"b","createdAt":"${iso(2)}","unit":"u"}\n`)
+      const rb = await readRetentionLog(bad)
+      eq('O2c: unparseable lines are skipped and counted', [rb.entries.length, rb.badLines, rb.repaired], [2, 1, false])
+      await rewriteRetentionLog(log, [r1.entries[1]])
+      const r2 = await readRetentionLog(log)
+      eq('O2d: the compaction rewrite keeps exactly the survivors, in order', r2.entries.map((e) => e.id), ['b'])
+      ok('O2d: no temp file remains after the rewrite', !existsSync(`${log}.tmp`))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // -- O3: the config channel (the env-only window, the batch knob, the
+  //        warn-and-keep degradations)
+  {
+    const base = { EMAIL_MAIN_USER: 'u@example.com', EMAIL_MAIN_PASS: 'p', EMAIL_MAIN_IMAP_HOST: 'h', EMAIL_MAIN_SMTP_HOST: 'h' }
+    const c1 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: '24h' }, () => {})
+    eq('O3a: a valid window resolves to ms on the account', c1.accounts[0].sessionRetentionMs, 86_400_000)
+    const c2 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: '4h30m', EMAIL_OFFLOAD_BATCH: '7' }, () => {})
+    eq('O3a: a two-segment window and a valid batch knob', [c2.accounts[0].sessionRetentionMs, c2.offloadBatch], [16_200_000, 7])
+    const warns = []
+    const c3 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: 'banana' }, (m) => warns.push(m))
+    ok('O3b: an invalid window warns and resolves to 0 (the account is kept)', c3.accounts[0].sessionRetentionMs === 0 && c3.accounts.length === 1 && warns.some((m) => m.includes('SESSION_RETENTION')))
+    const c4 = parseEnv(base, () => {})
+    eq('O3c: an absent window and an absent knob fall back silently', [c4.accounts[0].sessionRetentionMs, c4.offloadBatch], [0, 50])
+    const warns3 = []
+    for (const v of ['0', '-2', 'abc']) {
+      parseEnv({ ...base, EMAIL_OFFLOAD_BATCH: v }, (m) => warns3.push(m))
+    }
+    const c5 = parseEnv({ ...base, EMAIL_OFFLOAD_BATCH: '0' }, () => {})
+    ok('O3d: an invalid knob warns and falls back to the default (the component stays on)', warns3.length === 3 && warns3.every((m) => m.includes('OFFLOAD_BATCH')) && c5.offloadBatch === 50)
+  }
+
+  // -- O4: round health (the disabled branches: unreachable service, missing
+  //        store root, the mount mismatch; the registry fallback)
+  {
+    await runCase(
+      ({ home, storeRoot }) => {
+        mkdirSync(storeRoot)
+        return makeSweeper(home, { storeRoot, services: {} })
+      },
+      ({ report, state }) => {
+        ok('O4a: an unreachable persistence service skips the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('persistence service is unreachable')))
+        eq('O4a: the skipped round performs no action', [report.candidates, report.offloaded, report.balance], [0, 0, 0])
+      },
+    )
+    await runCase(
+      ({ home, storeRoot }) => {
+        // The store root is never created (missing on this host).
+        return makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot) } })
+      },
+      ({ report, state }) => {
+        ok('O4b: a missing store root disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('store root is missing')))
+      },
+    )
+    await runCase(
+      ({ home, storeRoot }) => {
+        mkdirSync(storeRoot)
+        return makeSweeper(home, {
+          storeRoot,
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          devOf: (p) => Promise.resolve(p.includes(OFFLOAD_ARCHIVE_DIR) ? 1 : 2),
+        })
+      },
+      ({ report, state }) => {
+        ok('O4c: a mount mismatch disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('different mounts')))
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        const handles = makeSweeper(home, {
+          storeRoot,
+          accounts: mapMain(),
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          now: () => T0,
+        })
+        makeSessionDir(storeRoot, 'o4', CWD)
+        await appendRetentionEntry(logPath, { id: 'o4', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return handles
+      },
+      ({ report, state }) => {
+        ok('O4d: an unreachable registry falls back to the in-flight set with a warning', report.offloaded === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        const inflight = new Set(['o4'])
+        const handles = makeSweeper(home, {
+          storeRoot,
+          accounts: mapMain(),
+          inflight,
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          now: () => T0,
+        })
+        makeSessionDir(storeRoot, 'o4', CWD)
+        await appendRetentionEntry(logPath, { id: 'o4', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return handles
+      },
+      async ({ report, state, logPath }) => {
+        ok('O4d: with the registry unreachable the in-flight set alone gates liveness', report.skippedLive === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
+        eq('O4d: the live entry stays in the log', (await readRetentionLog(logPath)).entries.length, 1)
+      },
+    )
+  }
+
+  // -- O5: the sweep core (window semantics, the existence table, the
+  //        liveness rollback, the retry, the unit-gone rule)
+  {
+    // Cell 1: source present, destination absent (the normal path).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'c1', CWD)
+        await appendRetentionEntry(logPath, { id: 'c1', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, storeRoot, archiveDir, logPath }) => {
+        eq('O5a: the over-window settled session is offloaded', [report.offloaded, report.candidates], [1, 1])
+        ok('O5a: the session dir left the store and entered the archive', !existsSync(path.join(storeRoot, 'a', 'c1')) && existsSync(path.join(archiveDir, 'c1')))
+        eq('O5a: the completed line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+      },
+    )
+    // Cell 2: neither side (the session was cleaned up externally).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        await appendRetentionEntry(logPath, { id: 'c2', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, logPath }) => {
+        eq('O5b: a session found on neither side completes without action', [report.sourceGone, report.offloaded], [1, 0])
+        eq('O5b: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+      },
+    )
+    // Cell 3: destination present, source absent (an earlier round already moved it).
+    await runCase(
+      async ({ home, storeRoot, logPath, archiveDir }) => {
+        mkdirSync(storeRoot)
+        mkdirSync(path.join(archiveDir, 'c3'), { recursive: true })
+        await appendRetentionEntry(logPath, { id: 'c3', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, logPath }) => {
+        eq('O5c: a session already in the archive completes without action', [report.alreadyArchived, report.offloaded], [1, 0])
+        eq('O5c: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+      },
+    )
+    // Cell 4: both sides present (a deployment anomaly: neither side is touched).
+    await runCase(
+      async ({ home, storeRoot, logPath, archiveDir }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'c4', CWD)
+        mkdirSync(path.join(archiveDir, 'c4'), { recursive: true })
+        await appendRetentionEntry(logPath, { id: 'c4', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, storeRoot, archiveDir, logPath, state }) => {
+        eq('O5d: a both-sides-present session is an error, both sides untouched', [report.errors, report.offloaded], [1, 0])
+        ok('O5d: the anomaly is logged for manual resolution', state.warns.some((m) => m.includes('c4') && m.includes('manual resolution')))
+        ok('O5d: both sides still exist and the line survives the round', existsSync(path.join(storeRoot, 'a', 'c4')) && existsSync(path.join(archiveDir, 'c4')) && (await readRetentionLog(logPath)).entries.length === 1)
+      },
+    )
+    // A rename failure (EIO): the entry is kept and the next round retries.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eio', CWD)
+        await appendRetentionEntry(logPath, { id: 'eio', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const err = new Error('i/o error')
+        err.code = 'EIO'
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
+      },
+      async ({ report, storeRoot, logPath, state }) => {
+        eq('O5e: a failed rename keeps the entry and the source', [report.errors, report.offloaded], [1, 0])
+        ok('O5e: the failure is logged and the retry is announced', state.warns.some((m) => m.includes('eio') && m.includes('retried next round')))
+        ok('O5e: the source dir is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eio')) && (await readRetentionLog(logPath)).entries.length === 1)
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eio', CWD)
+        await appendRetentionEntry(logPath, { id: 'eio', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      ({ report, archiveDir }) => {
+        eq('O5e: the next round (failure gone) offloads the same entry', [report.offloaded, report.errors], [1, 0])
+        ok('O5e: the retry landed in the archive', existsSync(path.join(archiveDir, 'eio')))
+      },
+    )
+    // A rename that reports ENOENT (the source vanished between the check and the move).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eno', CWD)
+        await appendRetentionEntry(logPath, { id: 'eno', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const err = new Error('no such file')
+        err.code = 'ENOENT'
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
+      },
+      async ({ report, logPath }) => {
+        eq('O5f: a rename ENOENT converges to source-gone', [report.sourceGone, report.errors], [1, 0])
+        eq('O5f: the entry completed and its line was removed', (await readRetentionLog(logPath)).entries.length, 0)
+      },
+    )
+    // A rename that reports EEXIST with the source gone (an earlier round moved it).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eex', CWD)
+        await appendRetentionEntry(logPath, { id: 'eex', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const err = new Error('file exists')
+        err.code = 'EEXIST'
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: async (s) => { rmSync(s, { recursive: true, force: true }); throw err } })
+      },
+      async ({ report, logPath }) => {
+        eq('O5g: an EEXIST with the source gone means the offload already happened', [report.alreadyArchived, report.errors], [1, 0])
+        eq('O5g: the entry completed', (await readRetentionLog(logPath)).entries.length, 0)
+      },
+    )
+    // A rename that reports EEXIST with the source still present (a true conflict).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eex', CWD)
+        await appendRetentionEntry(logPath, { id: 'eex', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const err = new Error('file exists')
+        err.code = 'EEXIST'
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
+      },
+      async ({ report, storeRoot, logPath }) => {
+        eq('O5g: an EEXIST with the source present is an error, both sides kept', [report.errors, report.offloaded], [1, 0])
+        ok('O5g: the source is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eex')) && (await readRetentionLog(logPath)).entries.length === 1)
+      },
+    )
+    // The locate call itself throws (a broken persistence backend).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        const broken = { locate: () => { throw new Error('backend down') } }
+        await appendRetentionEntry(logPath, { id: 'loc', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: broken, sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, logPath, state }) => {
+        eq('O5h: a locate failure keeps the entry for the next round', [report.errors, report.offloaded], [1, 0])
+        ok('O5h: the failure is logged with the session id', state.warns.some((m) => m.includes('locating session loc failed')))
+        eq('O5h: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
+      },
+    )
+    // The liveness rollback: the session goes live between the gate and the move.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'rb', CWD)
+        await appendRetentionEntry(logPath, { id: 'rb', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const reg = makeRegistry()
+        const handles = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: reg }, now: () => T0 })
+        return {
+          sweeper: new OffloadSweeper({
+            ctx: { get: (name) => (name === 'sessionPersistence' ? makeSpService(handles.storeRoot) : name === 'sessions' ? reg : undefined), logger: () => ({ warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }) },
+            logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+            home: { base: path.join(home, OFFLOAD_HOME_BASE), archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR), log: logPath, storeRoot: handles.storeRoot },
+            accounts: mapMain(),
+            inflight: new Set(),
+            cap: DEFAULT_OFFLOAD_BATCH,
+            now: () => T0,
+            move: async () => {
+              reg.known.add('rb') // the session goes live in the gap
+            },
+          }),
+          state: handles.state,
+        }
+      },
+      async ({ report, storeRoot, archiveDir, logPath }) => {
+        eq('O5i: a session that goes live in the gap is neither offloaded nor an error', [report.offloaded, report.errors, report.skippedLive], [0, 0, 0])
+        ok('O5i: the rollback moved the session back to the store', existsSync(path.join(storeRoot, 'a', 'rb')) && !existsSync(path.join(archiveDir, 'rb')))
+        eq('O5i: the entry is kept for the next round', (await readRetentionLog(logPath)).entries.length, 1)
+      },
+    )
+    // The unit-gone rule: no age check, the liveness gate still applies.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'ug', CWD)
+        await appendRetentionEntry(logPath, { id: 'ug', createdAt: iso(T0 - 1000), unit: 'ghost', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      ({ report, archiveDir }) => {
+        eq('O5j: a vanished unit is offloaded immediately, regardless of age', [report.offloaded, report.candidates], [1, 1])
+        ok('O5j: the fresh (within-window-age) session was moved', existsSync(path.join(archiveDir, 'ug')))
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'ugl', CWD)
+        const reg = makeRegistry(['ugl'])
+        await appendRetentionEntry(logPath, { id: 'ugl', createdAt: iso(T0 - 1000), unit: 'ghost', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: reg }, now: () => T0 })
+      },
+      ({ report }) => {
+        eq('O5j: the liveness gate still applies to a vanished unit', [report.skippedLive, report.offloaded], [1, 0])
+      },
+    )
+    // The window-0 unit (retention closed): entries are kept, never candidates.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'keep', CWD)
+        await appendRetentionEntry(logPath, { id: 'keep', createdAt: iso(T0 - 10 * 365 * W), unit: 'cold', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: new Map([['cold', 0]]), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      async ({ report, logPath }) => {
+        eq('O5k: a window-0 unit keeps even ancient entries', [report.candidates, report.offloaded], [0, 0])
+        eq('O5k: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
+      },
+    )
+    // Reopening the window re-manages the retained entries (over-window
+    // offloaded, within-window kept).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'old', CWD)
+        makeSessionDir(storeRoot, 'new', CWD)
+        await appendRetentionEntry(logPath, { id: 'old', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        await appendRetentionEntry(logPath, { id: 'new', createdAt: iso(T0 - 1000), unit: 'main', cwd: CWD })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      ({ report, archiveDir, storeRoot }) => {
+        eq('O5l: the reopened window offloads the over-window entries and keeps the fresh one', [report.offloaded, report.candidates], [1, 1])
+        ok('O5l: the over-window session is archived, the fresh one stays in the store', existsSync(path.join(archiveDir, 'old')) && existsSync(path.join(storeRoot, 'a', 'new')))
+      },
+    )
+    // A cwd-less entry resolves through the _no-cwd project dir.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'nc', undefined)
+        await appendRetentionEntry(logPath, { id: 'nc', createdAt: iso(T0 - 2 * W), unit: 'main' })
+        return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+      },
+      ({ report, archiveDir }) => {
+        eq('O5m: a cwd-less entry is offloaded through the no-cwd project dir', [report.offloaded, report.errors], [1, 0])
+        ok('O5m: the archive copy is named after the session id', existsSync(path.join(archiveDir, 'nc')))
+      },
+    )
+    // The archive dir is rebuilt after external deletion (the next round heals).
+    await runCase(
+      async ({ home, storeRoot, logPath, archiveDir }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'h1', CWD)
+        makeSessionDir(storeRoot, 'h2', CWD)
+        await appendRetentionEntry(logPath, { id: 'h1', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        await appendRetentionEntry(logPath, { id: 'h2', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        const handles = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        await handles.sweeper.sweep() // the first round: both offloaded, the archive exists
+        rmSync(archiveDir, { recursive: true, force: true }) // the operator wiped it
+        makeSessionDir(storeRoot, 'h3', CWD)
+        await appendRetentionEntry(logPath, { id: 'h3', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        return handles
+      },
+      ({ report, archiveDir }) => {
+        eq('O5n: after the archive dir was deleted externally the next round rebuilds it and continues', [report.offloaded, report.errors], [1, 0])
+        ok('O5n: the rebuilt archive holds the new offload', existsSync(path.join(archiveDir, 'h3')))
+      },
+    )
+  }
+
+  // -- O6: the per-sweep budget (file order, the oldest-first identity, the
+  //        knob, the compaction regimes, sweep idempotency)
+  {
+    // 51 candidates with the default cap of 50: the first round takes the
+    // fifty oldest (file order), the second round the remainder.
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (let i = 0; i < 51; i++) {
+          const id = `n${String(i).padStart(2, '0')}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const first = await sweeper.sweep()
+        eq('O6a: the first round offloads exactly the budget', [first.offloaded, first.candidates], [50, 50])
+        eq('O6a: the identity is the fifty oldest entries, in file order', JSON.stringify((await readRetentionLog(logPath)).entries.map((e) => e.id)), JSON.stringify(['n50']))
+        const second = await sweeper.sweep()
+        eq('O6a: the second round offloads the single remainder', [second.offloaded, second.candidates], [1, 1])
+        eq('O6a: the log is empty after both rounds', (await readRetentionLog(logPath)).entries.length, 0)
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // The knob: cap 3 over five candidates (three offloaded in file order, then two).
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (const id of ['k1', 'k2', 'k3', 'k4', 'k5']) {
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), cap: 3, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const first = await sweeper.sweep()
+        eq('O6b: a valid knob value caps the round', [first.offloaded, first.candidates], [3, 3])
+        const second = await sweeper.sweep()
+        eq('O6b: the remainder drains on the next round', second.offloaded, 2)
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Compaction regime 1: the rate fits the budget (the file drains to
+    // steady state, the second round is a zero-action no-op).
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (let i = 0; i < 30; i++) {
+          const id = `s${i}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const first = await sweeper.sweep()
+        eq('O6c: the rate within the budget drains the file in one round', [first.offloaded, first.removedLines, first.balance], [30, 30, 0])
+        eq('O6c: the compaction ratio triggered the rewrite', first.completedRatio, 1)
+        const second = await sweeper.sweep()
+        eq('O6c: the next round is a zero-action no-op (sweep idempotency)', [second.candidates, second.offloaded, second.removedLines, second.balance, second.increment], [0, 0, 0, 0, 0])
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Compaction regime 2: the rate exceeds the budget (the rewrite runs
+    // while the completed share stays high; the balance creeps up by the
+    // overrun per round).
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        const archiveDir = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), cap: 3, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const rounds = []
+        for (let r = 0; r < 3; r++) {
+          for (let i = 0; i < 5; i++) {
+            const id = `r${r}${i}`
+            makeSessionDir(storeRoot, id, CWD)
+            await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+          }
+          rounds.push(await sweeper.sweep())
+        }
+        eq('O6d: the over-budget rate rewrites while the completed share stays high', JSON.stringify(rounds.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[3, 3, 2], [3, 3, 4], [3, 3, 6]]))
+        ok('O6d: every offload landed in the archive', existsSync(path.join(archiveDir, 'r00')) && existsSync(path.join(archiveDir, 'r13')))
+        eq('O6d: the file line count equals the reported balance', readFileSync(logPath, 'utf8').trim().split('\n').length, 6)
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  // -- O7: the trend alert (the consecutive over-envelope increments, the
+  //        healthy negatives, the out-of-regime dormant branch, the knob
+  //        recovery)
+  {
+    // Positive: the arrivals keep exceeding the budget for K rounds in a row.
+    // (The first round only re-derives the balance baseline: it never judges.)
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: new Map([['cold', 0]]), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const results = []
+        for (let r = 0; r < 13; r++) {
+          for (let i = 0; i < 60; i++) await appendRetentionEntry(logPath, { id: `t${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        const alerts = results.map((rp) => rp.trendAlert)
+        eq('O7a: the alert fires exactly on the K-th consecutive over-envelope sweep', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true, true]))
+        eq('O7a: the balance grows by the arrivals each round', results[12].balance, 13 * 60)
+        eq('O7a: the reported increment is the arrivals', results[12].increment, 60)
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Healthy negative: bursts shorter than K rounds reset the counter.
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: new Map([['cold', 0]]), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const results = []
+        for (let r = 0; r < 8; r++) {
+          const burst = r < 3 ? 60 : 0
+          for (let i = 0; i < burst; i++) await appendRetentionEntry(logPath, { id: `h${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        ok('O7b: a burst shorter than K rounds never alerts', results.every((rp) => !rp.trendAlert))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // At the boundary: arrivals equal to the budget are not over it (strict).
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, { storeRoot, accounts: new Map([['cold', 0]]), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
+        const results = []
+        for (let r = 0; r < 12; r++) {
+          for (let i = 0; i < 50; i++) await appendRetentionEntry(logPath, { id: `b${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        ok('O7c: arrivals at exactly the budget never alert (the comparison is strict)', results.every((rp) => !rp.trendAlert))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Out of regime: the rate is at least four times the budget (the
+    // compaction trigger stays dormant, the alert is the visible signal);
+    // raising the knob recovers it and flushes the completed backlog.
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        const services = { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }
+        const accounts = mapMain()
+        const quiet = () => ({ warn: () => {}, error: () => {}, info: () => {}, debug: () => {} })
+        const mkCtx = () => ({
+          get: (name) => (services[name] !== undefined ? services[name] : undefined),
+          logger: () => quiet(),
+        })
+        let sweeper = new OffloadSweeper({
+          ctx: mkCtx(),
+          logger: quiet(),
+          home: { base: path.join(home, OFFLOAD_HOME_BASE), archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR), log: logPath, storeRoot },
+          accounts,
+          inflight: new Set(),
+          cap: 5,
+          now: () => T0,
+        })
+        const results = []
+        for (let r = 0; r < 12; r++) {
+          for (let i = 0; i < 21; i++) {
+            const id = `o${r}-${i}`
+            makeSessionDir(storeRoot, id, CWD)
+            await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+          }
+          results.push(await sweeper.sweep())
+        }
+        const alerts = results.map((rp) => rp.trendAlert)
+        eq('O7d: the out-of-regime rate alerts after K consecutive rounds', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true]))
+        ok('O7d: the compaction trigger stayed dormant through the whole burst', results.every((rp) => rp.removedLines === 0 && rp.completedRatio < COMPACTION_RATIO))
+        eq('O7d: the deadweight backlog accumulated in the log file', readFileSync(logPath, 'utf8').trim().split('\n').length, 12 * 21)
+        // The operator raises the knob: a fresh instance (like a process
+        // restart) re-derives the baseline and the streak starts over.
+        sweeper = new OffloadSweeper({
+          ctx: mkCtx(),
+          logger: quiet(),
+          home: { base: path.join(home, OFFLOAD_HOME_BASE), archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR), log: logPath, storeRoot },
+          accounts,
+          inflight: new Set(),
+          cap: 25,
+          now: () => T0,
+        })
+        const recovery = []
+        for (let r = 0; r < 3; r++) {
+          recovery.push(await sweeper.sweep())
+        }
+        eq('O7d: the raised knob re-enables the compaction trigger and flushes the backlog', JSON.stringify(recovery.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[25, 85, 167], [25, 0, 167], [25, 50, 117]]))
+        ok('O7d: no trend alert under the recovered budget', recovery.every((rp) => !rp.trendAlert))
+        const survivors = (await readRetentionLog(logPath)).entries
+        eq('O7d: only the pending (never-offloaded) lines survived the flush', survivors.length, 117)
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // O7e: the alert line content (growth rate = (increment - cap) per sweep
+    // and the branch discriminator: dormant out-of-regime vs active in-regime).
+    {
+      for (const [arrivals, cap, dormant] of [[21, 5, true], [12, 10, false]]) {
+        const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+        try {
+          const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+          const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+          const services = { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }
+          const accounts = mapMain()
+          const warns = []
+          const mkLog = () => ({ warn: (m) => warns.push(m), error: () => {}, info: () => {}, debug: () => {} })
+          const sweeper = new OffloadSweeper({
+            ctx: {
+              get: (name) => (services[name] !== undefined ? services[name] : undefined),
+              logger: () => mkLog(),
+            },
+            logger: mkLog(),
+            home: { base: path.join(home, OFFLOAD_HOME_BASE), archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR), log: logPath, storeRoot },
+            accounts,
+            inflight: new Set(),
+            cap,
+            now: () => T0,
+          })
+          for (let r = 0; r < 12; r++) {
+            for (let i = 0; i < arrivals; i++) {
+              const id = `x${arrivals}-${r}-${i}`
+              makeSessionDir(storeRoot, id, CWD)
+              await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+            }
+            await sweeper.sweep()
+          }
+          const alert = warns.find((m) => m.includes('trend alert'))
+          const want = dormant
+            ? ['growth rate 16/sweep', 'permanently dormant', 'completed lines are never evicted', 'check the offload batch knob first']
+            : ['growth rate 2/sweep', 'still active', 'raise the offload batch knob or lower the dispatch rate']
+          ok(
+            `O7e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`,
+            alert !== undefined && want.every((f) => alert.includes(f)),
+            alert,
+          )
+          sweeper.dispose()
+        } finally {
+          rmSync(home, { recursive: true, force: true })
+        }
+      }
+    }
+  }
+
+  // -- O8: the periodic arming (the immediate first round, the disposer)
+  {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+    try {
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot)
+      const { sweeper, state } = makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() } })
+      sweeper.start()
+      ok('O8a: start arms an immediate first round', await waitFor(() => state.infos.some((m) => m.includes('sweep done')), 2000))
+      sweeper.start() // re-arming is a no-op
+      sweeper.dispose()
+      ok('O8a: dispose stops the timer without error', true)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+
+  // -- O9: the plugin integration (the write gate, the append failure, the
+  //        disabled component, the shared in-flight set)
+  async function tServer(fn, opts = {}) {
+    const srv = await startImapServer(opts)
+    try {
+      await fn(srv)
+    } finally {
+      await srv.stop()
+    }
+  }
+  {
+    // The write gate: a dispatched session is logged only when its account's
+    // retention window is enabled at dispatch time.
+    await tServer(async (srv) => {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const env = { ...envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' }, sessionRetention: '24h' }) }
+        const agents = makeAgentsService({ turnEnd: 'completed' })
+        const services = {
+          agents,
+          dshHomePath: (p) => path.join(home, p),
+          sessionPersistence: makeSpService(storeRoot),
+          sessions: makeRegistry(),
+        }
+        await withTriggerEnv(env, async () => {
+          const { ctx, state } = fakeCtx(services)
+          new DshEmailPlugin(ctx, {})
+          ok('O9a: the plugin registers the offload sweep effect', state.effects.some((e) => e.label === 'dsh-email offload sweep'))
+          await sleep(300) // let the immediate sweep round settle on the empty log
+          const tStart = Date.now()
+          srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+          srv.pushExists('INBOX', 1)
+          ok('O9a: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
+          const c = agents.creates[0]
+          const tEnd = Date.now()
+          ok('O9a: the dispatched session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+          eq('O9a: the dispatch carries the plugin workspace in the meta', c.meta?.cwd, path.join(home, 'dsh-email', 'workspace'))
+          // The retention append is fire-and-forget: poll until it lands.
+           ok('O9b: the write gate logged exactly the dispatched session', await waitFor(async () => {
+             if (!existsSync(logPath)) return false
+             const r = await readRetentionLog(logPath)
+             return r.entries.length === 1
+           }, 4000))
+          const line = (await readRetentionLog(logPath)).entries[0]
+          ok('O9b: the log line carries the session id, the unit, the dispatch time and the workspace', line.id === c.sessionId && line.unit === 'main' && line.cwd === c.meta.cwd && Date.parse(line.createdAt) >= tStart && Date.parse(line.createdAt) <= tEnd)
+          eq('O9b: the offload rounds stayed silent (healthy store)', state.warns.filter((m) => m.includes('offload')).length, 0)
+          for (const e of state.effects) e.dispose()
+        })
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }, { folders: { INBOX: { messages: [] } } })
+    // The write gate closed: no window, no log line (the session is untracked).
+    await tServer(async (srv) => {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const env = envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } })
+        const agents = makeAgentsService({ turnEnd: 'completed' })
+        const services = {
+          agents,
+          dshHomePath: (p) => path.join(home, p),
+          sessionPersistence: makeSpService(storeRoot),
+          sessions: makeRegistry(),
+        }
+        await withTriggerEnv(env, async () => {
+          const { ctx, state } = fakeCtx(services)
+          new DshEmailPlugin(ctx, {})
+          await sleep(300)
+          srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+          srv.pushExists('INBOX', 1)
+          ok('O9c: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
+          await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1')))
+          eq('O9c: without a retention window the write gate logs nothing', existsSync(logPath), false)
+          for (const e of state.effects) e.dispose()
+        })
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }, { folders: { INBOX: { messages: [] } } })
+    // A failed retention log write (the log path is a directory): the
+    // dispatch continues untracked, the sweep round degrades to a warning.
+    await tServer(async (srv) => {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        mkdirSync(storeRoot)
+        mkdirSync(path.join(home, OFFLOAD_HOME_BASE), { recursive: true })
+        mkdirSync(path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)) // a directory: appends fail
+        const env = { ...envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' }, sessionRetention: '24h' }) }
+        const agents = makeAgentsService({ turnEnd: 'completed' })
+        const services = {
+          agents,
+          dshHomePath: (p) => path.join(home, p),
+          sessionPersistence: makeSpService(storeRoot),
+          sessions: makeRegistry(),
+        }
+        await withTriggerEnv(env, async () => {
+          const { ctx, state } = fakeCtx(services)
+          new DshEmailPlugin(ctx, {})
+          await sleep(300)
+          srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+          srv.pushExists('INBOX', 1)
+          ok('O9d: a retention log write failure does not fail the dispatch', await waitFor(() => agents.creates.length >= 1, 4000))
+          ok('O9d: the session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+          ok('O9d: the failed write is warned as an untracked session', state.warns.some((m) => m.includes('retention log') && m.includes('untracked')))
+          for (const e of state.effects) e.dispose()
+        })
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }, { folders: { INBOX: { messages: [] } } })
+    // The in-flight set: a dispatched session is in it until it settles. A
+    // watcher dispose detaches the in-flight dispatch (it settles on its
+    // own); the membership survives the dispose and ends at the settlement.
+    await tServer(async (srv) => {
+      srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+      const agents = makeAgentsService({ hang: true }) // the turn never ends on its own
+      const inflight = new Set()
+      const { watcher } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+        services: { agents },
+        inflight,
+      })
+      ok('O9e: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
+      const id = agents.creates[0].sessionId
+      await sleep(150)
+      ok('O9e: the unsettled session stays in the shared in-flight set', inflight.has(id) === true)
+      watcher.dispose()
+      await sleep(150)
+      ok('O9e: the dispose detaches the dispatch without untracking it', inflight.has(id) === true)
+      ok('O9e: the detached dispatch settles on its own', agents.settleNext('completed') === true)
+      ok('O9e: the settlement removes the session from the set', await waitFor(() => inflight.has(id) === false, 4000))
+    }, { folders: { INBOX: { messages: [] } } })
+    await tServer(async (srv) => {
+      srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+      const agents = makeAgentsService({ turnEnd: 'completed' })
+      const inflight = new Set()
+      const { watcher, state } = startTriggerWatcher(srv, {
+        trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+        services: { agents },
+        inflight,
+      })
+      ok('O9f: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
+      const id = agents.creates[0].sessionId
+      ok('O9f: the settled session leaves the in-flight set', (await waitFor(() => inflight.has(id) === false, 4000)) === true && state.infos.some((m) => m.includes('settled for uid 1')))
+      watcher.dispose()
+    }, { folders: { INBOX: { messages: [] } } })
+    // The offload component disabled (no dshHomePath): a warning, no sweep,
+    // no write gate; the dispatch degrades to a workspace-less create.
+    await tServer(async (srv) => {
+      srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+      const env = { ...envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' }, sessionRetention: '24h' }) }
+      const agents = makeAgentsService({ turnEnd: 'completed' })
+      await withTriggerEnv(env, async () => {
+        const { ctx, state } = fakeCtx({ agents, sessionPersistence: makeSpService('/nonexistent-store'), sessions: makeRegistry() })
+        new DshEmailPlugin(ctx, {})
+        ok('O9g: the disabled component warns at boot', state.warns.some((m) => m.includes('offload component is disabled')))
+        eq('O9g: no sweep effect is registered', state.effects.filter((e) => e.label === 'dsh-email offload sweep').length, 0)
+        ok('O9g: the trigger dispatch still works (workspace-less create)', await waitFor(() => agents.creates.length >= 1, 4000))
+        const c = agents.creates[0]
+        ok('O9g: the create carries no workspace meta', !('meta' in c))
+        await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1')))
+        for (const e of state.effects) e.dispose()
+      })
+    }, { folders: { INBOX: { messages: [] } } })
+  }
+  // -- O10: the lost-retention-log startup warning (edge #10) and the
+  //        append<->compaction mutex (the rewrite-window seam).
+  {
+    const mkSweeperCase = async (seed) => {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const archive = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const services = { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }
+        const warns = []
+        const mkLog = () => ({ warn: (m) => warns.push(m), error: () => {}, info: () => {}, debug: () => {} })
+        seed(archive, home)
+        const sweeper = new OffloadSweeper({
+          ctx: { get: (n) => (services[n] !== undefined ? services[n] : undefined), logger: () => mkLog() },
+          logger: mkLog(),
+          home: { base: path.join(home, OFFLOAD_HOME_BASE), archive, log: logPath, storeRoot },
+          accounts: mapMain(),
+          inflight: new Set(),
+          cap: 50,
+          now: () => T0,
+        })
+        await sweeper.sweep()
+        await sweeper.sweep()
+        sweeper.dispose()
+        return warns.filter((m) => m.includes('retention log is missing'))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    const fresh = await mkSweeperCase(() => {})
+    eq('O10a: a fresh install (no archive, no log) stays silent', fresh.length, 0)
+    const lost = await mkSweeperCase((archive) => {
+      mkdirSync(path.join(archive, 'x'), { recursive: true })
+      writeFileSync(path.join(archive, 'x', 'session.v4.jsonl.zstd'), 'log')
+    })
+    ok('O10b: the lost log warns prominently on startup (exactly once across rounds)', lost.length === 1, lost)
+    // O10c: park the compaction rewrite between its temp write and its rename,
+    // append across the window, and prove the mutex serializes the append onto
+    // the post-rename file (the line survives).
+    {
+      const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const archive = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot, { recursive: true })
+        mkdirSync(archive, { recursive: true })
+        // Four entries pre-archived (completed), one live (kept by the
+        // rewrite): the round rewrites the log down to the live line.
+        const liveId = 'm4'
+        for (let i = 0; i < 5; i++) {
+          const id = `m${i}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        }
+        for (let i = 0; i < 4; i++) {
+          renameSync(path.join(storeRoot, path.basename(CWD), `m${i}`), path.join(archive, `m${i}`))
+        }
+        let parked = false
+        let release
+        const gate = new Promise((r) => { release = r })
+        offload.rewriteBarrier.fn = async () => {
+          parked = true
+          await gate
+        }
+        const quiet = () => ({ warn: () => {}, error: () => {}, info: () => {}, debug: () => {} })
+        const sweeper = new OffloadSweeper({
+          ctx: {
+            get: (n) =>
+              n === 'sessionPersistence'
+                ? makeSpService(storeRoot)
+                : n === 'sessions'
+                  ? makeRegistry([liveId])
+                  : undefined,
+            logger: () => quiet(),
+          },
+          logger: quiet(),
+          home: { base: path.join(home, OFFLOAD_HOME_BASE), archive, log: logPath, storeRoot },
+          accounts: mapMain(),
+          inflight: new Set(),
+          cap: 50,
+          now: () => T0,
+        })
+        // A ref'd keep-alive handle: the parked rewrite and the queued
+        // append are pure promise chains, which alone would let the event
+        // loop empty and end the process mid-window.
+        const keepAlive = setInterval(() => {}, 50)
+        const run = sweeper.sweep()
+        await waitFor(() => parked)
+        // The append is created (queued behind the rewrite in the mutex) but
+        // not awaited yet: awaiting it before the release would deadlock,
+        // because the rewrite holds the mutex until its rename.
+        const pendingAppend = appendRetentionEntry(logPath, { id: 'mnew', createdAt: iso(T0 - 2 * W), unit: 'main', cwd: CWD })
+        release()
+        await pendingAppend
+        const rep = await run
+        clearInterval(keepAlive)
+        const after = (await readRetentionLog(logPath)).entries
+        ok(
+          'O10c: an append parked in the rewrite window survives the rewrite (the write mutex)',
+          rep.removedLines === 4 && after.length === 2 && after.some((e) => e.id === liveId) && after.some((e) => e.id === 'mnew'),
+          JSON.stringify([rep.removedLines, after.map((e) => e.id)]),
+        )
+        sweeper.dispose()
+      } finally {
+        offload.rewriteBarrier.fn = undefined
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+  }
 }
 
 // selftest hygiene guard

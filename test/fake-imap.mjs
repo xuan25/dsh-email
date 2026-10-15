@@ -243,7 +243,7 @@ function leafBodyStructure(node) {
 /** Render a parts tree into the IMAP BODYSTRUCTURE expression. */
 function renderBodyStructure(node) {
   if (node.parts) {
-    const [major, minor] = node.type.split('/')
+    const [, minor] = node.type.split('/')
     const kids = node.parts.map((p) => renderBodyStructure(p)).join(' ')
     return `(${kids} "${minor}" (boundary "${node.boundary}") NIL)`
   }
@@ -525,9 +525,7 @@ function handleImapSocket(socket, serverState) {
   // the wire the current transport state reads and writes on: the raw socket
   // until STARTTLS upgrades it in place, the TLS socket afterwards
   let live = socket
-  let user = null
   let selected = null
-  let selectedReadOnly = false
   let buf = Buffer.alloc(0)
   let stopped = false
   // once the auth-hang injection triggers, the connection consumes every
@@ -602,7 +600,6 @@ function handleImapSocket(socket, serverState) {
       return false
     }
     selected = folderName
-    selectedReadOnly = readOnly
     const count = folder.messages.length
     sendLine(`* ${count} EXISTS`)
     sendLine('* 0 RECENT')
@@ -632,7 +629,7 @@ function handleImapSocket(socket, serverState) {
       } else if (I.startsWith('BODY.PEEK[') || I.startsWith('BODY[') || I === 'RFC822') {
         const sectionMatch = item.match(/^(?:BODY|RFC822)(?:\.PEEK)?\[(.*?)\](?:<(\d+)\.(\d+)>)?$/i)
         if (!sectionMatch) continue
-        let section = (sectionMatch[1] ?? '').toUpperCase()
+        const section = (sectionMatch[1] ?? '').toUpperCase()
         const start = sectionMatch[2] !== undefined ? Number(sectionMatch[2]) : 0
         const len = sectionMatch[3] !== undefined ? Number(sectionMatch[3]) : Infinity
         if (section === '') {
@@ -760,7 +757,6 @@ function handleImapSocket(socket, serverState) {
       const u = args[0]
       const p = args[1]
       if (typeof u === 'string' && serverState.users[u] === p) {
-        user = u
         send(`${tag} OK Login completed`)
         // the server goes silent right after a successful login: every later
         // command on this connection is consumed and never answered, which
@@ -834,7 +830,6 @@ function handleImapSocket(socket, serverState) {
         send(`${tag} BAD APPEND requires a literal source`)
         return
       }
-      const n = Number(dataMatch[1])
       // the literal bytes are read by the connection reader and stashed here
       const source = pendingLiteral ?? Buffer.alloc(0)
       pendingLiteral = undefined

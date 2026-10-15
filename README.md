@@ -9,6 +9,7 @@ dsh-email gives a DSH agent working access to a mailbox: the `email` tool reads 
 - Multiple accounts in one plugin
 - Deletion is per-account gated: delete and delete_folder run only on accounts that opt in
 - Optional new-mail trigger: a per-account resident watcher dispatches a fresh agent session per new mail, running an operator-defined policy prompt
+- Session offload: a per-minute sweep archives settled trigger sessions that outlived their account's retention window (env-only: EMAIL_<N>_SESSION_RETENTION), keeping the framework session store bounded
 - Stateless verbs: one fresh connection per call (the trigger watcher is the only resident connection, only on enabled accounts)
 
 ## Installation
@@ -20,7 +21,10 @@ dsh plugin --profile <name> add dsh-email
 ```
 
 Configuration is layered: built-in defaults, the `EMAIL_*` env block, and a
-cordis config layer (see below); the plugin creates no config or state files.
+cordis config layer (see below); the plugin creates no config or state files
+in the profile directory (its only on-disk state is the session offload's
+retention log and archive under `$DSH_HOME/dsh-email/`, used only by the
+trigger plane, see Session offload).
 
 ## Configuration
 
@@ -45,6 +49,7 @@ restart. One account needs four variables, the rest are optional:
 | `EMAIL_<N>_SENT_FOLDER_AUTOCREATE` | no | default `true`: when the SENT_FOLDER copy fails because the folder is missing, create it (the exact name INBOX is never created) and retry once; `false` = never create |
 | `EMAIL_<N>_ALLOW_DELETE` | no | default `false` (fail-closed): the gate for the `delete` and `delete_folder` verbs on this account; `true` = the agent may delete messages and mailboxes on it |
 | `EMAIL_<N>_TIMEOUT_MS` | no | per-call timeout budget, default 120000 |
+| `EMAIL_<N>_SESSION_RETENTION` | no | default `0` (no offload): the retention window for trigger sessions on this account (env-only) - a non-negative integer ms or a duration of 1-2 segments in d/h/m/s/ms descending order (e.g. `24h`, `4h30m`, `90s`, `5000ms`; a bare numeric string is invalid); invalid values warn at boot and resolve to 0 (see Session offload) |
 | `EMAIL_<N>_TRIGGER_ENABLE` | no | default `false`: enable the new-mail trigger watcher on this account (see New mail trigger) |
 | `EMAIL_<N>_TRIGGER_PROMPT` | required when TRIGGER_ENABLE=true | the operator policy injected verbatim into every trigger session |
 | `EMAIL_<N>_TRIGGER_FOLDER` | no | the folder the watcher listens on, default `INBOX` |
@@ -54,6 +59,7 @@ restart. One account needs four variables, the rest are optional:
 | `EMAIL_<N>_TRIGGER_PRESET` | no | named agent preset for trigger sessions; absent = the deployment default |
 | `EMAIL_DEFAULT_ACCOUNT` | no | the account used when a call names no account |
 | `EMAIL_READ_BODY_LIMIT` | no | read body truncation budget in characters, default 20000 |
+| `EMAIL_OFFLOAD_BATCH` | no | per-sweep offload budget (max trigger sessions one sweep may move to the archive), default 50; an invalid value warns and falls back to 50, never disables the sweep |
 
 The `<N>` segment is the account name uppercased; the account name must match `^[a-z][a-z0-9-]{0,31}$`. Accounts missing any required variable are dropped with a boot warning (boot never fails). Multiple accounts are supported.
 
@@ -110,6 +116,10 @@ Each session receives a three-part prompt (no body excerpt): a type label naming
 - Failure modes all fail visible and self-heal: connect / command failures close the connection and reconnect through an exponential backoff (5s x 2, capped at 60s), then resync on the fresh connection (new mail that arrived in the meantime is picked up); a queue overflow, a failed dispatch (agents service missing, unresolvable preset, turn error) and a missing EXAMINE folder are visible log entries. The only non-self-healing state is the missing watched folder (the watcher stops and waits for the setting or the folder to change).
 - Trigger accounts without the `agents` service on the host (or with a malformed trigger configuration) start no watcher: the account stays fully usable through every mail verb, zero connections.
 - Division of labor: the trigger handles per-event reactions to new mail; periodic batch work over a mailbox stays with a scheduler (e.g. a dsh-timer cron job) - the two coexist, the watcher only ever reacts to UNSEEN mail.
+
+## Session offload
+
+Trigger sessions leave on-disk session logs in the framework session store; at trigger-mail volume the store grows without bound. The per-minute offload sweep archives settled trigger sessions once the account's retention window elapses, so the store stays bounded: the store is never deleted, only moved, a session that is still running is kept until it settles, and a removed account is offloaded immediately regardless of age. The retention window and the per-sweep budget are the `SESSION_RETENTION` and `EMAIL_OFFLOAD_BATCH` settings in the table above (window syntax included). An unreachable persistence service, a missing store root, or an archive on a different mount disables the sweep for that round (a visible warning; log lines are never lost); a failed individual move is retried next round.
 
 ## Usage
 
