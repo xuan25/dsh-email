@@ -59,6 +59,12 @@ export interface TriggerConfig {
   queueMax: number
   /** Named agent preset; absent = deployment default. */
   preset?: string
+  /**
+   * The trigger session's reasoning effort, a member of the closed level set
+   * (config.ts REASONING_EFFORTS); passed through to the framework's
+   * AgentOptions.reasoningEffort. Absent = the framework's provider default.
+   */
+  reasoningEffort?: string
 }
 
 /** One configured mail account (IMAP + SMTP endpoint pair, shared credentials). */

@@ -34,6 +34,7 @@ const {
   DEFAULT_SMTP_TLS,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_READ_BODY_LIMIT,
+  REASONING_EFFORTS,
 } = await import(path.join(PKG, 'lib', 'config.js'))
 const {
   VERBS,
@@ -409,6 +410,7 @@ function envOne(name, o = {}) {
     if (trigger.maxConcurrent) env[`EMAIL_${name}_TRIGGER_MAX_CONCURRENT`] = String(trigger.maxConcurrent)
     if (trigger.queueMax) env[`EMAIL_${name}_TRIGGER_QUEUE_MAX`] = String(trigger.queueMax)
     if (trigger.preset) env[`EMAIL_${name}_TRIGGER_PRESET`] = trigger.preset
+    if (trigger.reasoningEffort) env[`EMAIL_${name}_TRIGGER_REASONING_EFFORT`] = trigger.reasoningEffort
   }
   return env
 }
@@ -684,6 +686,11 @@ async function withServer(start, fn) {
   eq('constants: default timeout/read-body-limit', [DEFAULT_TIMEOUT_MS, DEFAULT_READ_BODY_LIMIT], [120000, 20000])
   eq('constants: raw header bound + marker', [RAW_HEADERS_LIMIT, RAW_HEADERS_TRUNCATED], [16384, '[dsh-email: header block truncated]'])
   eq('constants: default save dir', DEFAULT_SAVE_DIR, 'attachments')
+  eq(
+    'constants: the reasoning effort level set (the framework closed set, sync obligation on framework growth)',
+    [...REASONING_EFFORTS],
+    ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  )
 }
 {
   ok('name regex: accepts lowercase with digits and hyphens', NAME_RE.test('a') && NAME_RE.test('abc-1') && NAME_RE.test('z9-' + 'x'.repeat(28)))
@@ -2845,7 +2852,7 @@ async function withServer(start, fn) {
     eq('W12: no reconnect after dispose', srv.state.openSockets.length, 0)
   }, { folders: { INBOX: { messages: [] } } })
 
-  // -- W13: the config layer: all seven trigger keys fold with defaults and
+  // -- W13: the config layer: all eight trigger keys fold with defaults and
   //         overrides; a malformed key warns, starts no watcher, and leaves
   //         the account fully usable
   {
@@ -2859,14 +2866,15 @@ async function withServer(start, fn) {
           triggerMaxConcurrent: 2,
           triggerQueueMax: 9,
           triggerPreset: 'pl',
+          triggerReasoningEffort: 'xhigh',
         },
       },
     }
     const f = foldConfig(base, layer, () => {})
     const t = f.accounts[0].trigger
-    eq('W13: the config layer folds to an on-state with all seven fields', [
-      t.kind, t.config.prompt, t.config.folder, t.config.idleMs, t.config.maxConcurrent, t.config.queueMax, t.config.preset,
-    ], ['on', 'layer policy', 'INBOX', 2000, 2, 9, 'pl'])
+    eq('W13: the config layer folds to an on-state with all eight fields', [
+      t.kind, t.config.prompt, t.config.folder, t.config.idleMs, t.config.maxConcurrent, t.config.queueMax, t.config.preset, t.config.reasoningEffort,
+    ], ['on', 'layer policy', 'INBOX', 2000, 2, 9, 'pl', 'xhigh'])
     const bad = foldConfig(base, { accounts: { main: { triggerIdleMs: 'abc' } } }, () => {})
     eq('W13: a malformed trigger field yields the malformed state', bad.accounts[0].trigger.kind, 'malformed')
   }
@@ -3023,6 +3031,108 @@ async function withServer(start, fn) {
       eq('W19b: exactly one connection (the malformed account opens none)', srv.state.openSockets.length, 1)
       for (const e of state.effects) e.dispose()
     })
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W20: the trigger session's reasoning effort (per-account trigger
+  //         surface): the closed level set is accepted end to end through the
+  //         shared validator (env and config channels), a level outside the
+  //         set is malformed (warned, no watcher, the account stays usable),
+  //         and the production dispatcher passes the set level through to the
+  //         framework's agent options - absent means the key is not passed
+  //         (the framework's provider default applies)
+  {
+    const per = (lv) =>
+      parseEnv(
+        envOne('main', { imapPort: 1, smtpPort: 1, trigger: { enable: true, prompt: 'P', reasoningEffort: lv } }),
+        () => {},
+      ).accounts[0].trigger
+    eq('W20-RE1: every level of the closed set folds to an on-state carrying it', REASONING_EFFORTS.map((lv) => per(lv).config.reasoningEffort), [...REASONING_EFFORTS])
+    const bad = per('banana')
+    eq('W20-RE1: a level outside the set is malformed', bad.kind, 'malformed')
+    eq(
+      'W20-RE1: the malformed reason names the value and the valid set',
+      bad.reason,
+      'TRIGGER_REASONING_EFFORT "banana" is not a valid level (off/minimal/low/medium/high/xhigh/max)',
+    )
+  }
+  await tServer(async (srv) => {
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, { accounts: { main: { triggerReasoningEffort: 'banana' } } })
+      eq('W20-RE2: an invalid level from the config layer starts no watcher', state.effects.length, 0)
+      ok('W20-RE2: the account trigger is reported malformed', state.warns.some((m) => m.includes('malformed') && m.includes('"main"')))
+      const out = doc(await state.tools[0].execute({ verb: 'folders', account: 'main' }))
+      ok('W20-RE2: the account stays fully usable (folders verb succeeds)', out && Array.isArray(out.folders))
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+  await tServer(async (srv) => {
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, { accounts: { main: { triggerReasoningEffort: {} } } })
+      eq('W20-RE2b: a non-scalar level from the config layer starts no watcher', state.effects.length, 0)
+      ok('W20-RE2b: the malformed reason demands a string', state.warns.some((m) => m.includes('must be a string')))
+    })
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, { accounts: { main: { triggerReasoningEffort: 42 } } })
+      eq('W20-RE2c: a numeric level is stringified at materialization and rejected as outside the set', state.effects.length, 0)
+      ok('W20-RE2c: the malformed reason names the closed set', state.warns.some((m) => m.includes('not a valid level')))
+    })
+    await withTriggerEnv(envOne('main', { imapPort: srv.port, smtpPort: 1, trigger: { enable: true, prompt: 'P' } }), async () => {
+      const { ctx, state } = fakeCtx(AGENTS)
+      new DshEmailPlugin(ctx, { accounts: { main: { triggerReasoningEffort: '' } } })
+      eq('W20-RE2d: an empty-string level from the config layer starts no watcher', state.effects.length, 0)
+      ok('W20-RE2d: the malformed reason names the closed set', state.warns.some((m) => m.includes('not a valid level')))
+    })
+  }, { folders: { INBOX: { messages: [] } } })
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const agents = makeAgentsService({ turnEnd: 'completed' })
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000, reasoningEffort: 'low' },
+      services: { agents },
+    })
+    ok('W20-RE3: the production dispatcher creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
+    const c = agents.creates[0]
+    ok(
+      'W20-RE3: the create carries the set level and no model route (no route source in this fixture)',
+      c.agentOptions?.reasoningEffort === 'low' && !('provider' in (c.agentOptions ?? {})) && !('model' in (c.agentOptions ?? {})),
+    )
+    ok('W20-RE3: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+    eq('W20-RE3: no warnings on the happy path', state.warns.length, 0)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const agents = makeAgentsService({ turnEnd: 'completed' })
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000, reasoningEffort: 'off' },
+      services: {
+        agents,
+        agentDefaultModel: { currentSelection: () => ({ provider: 'prov-x', model: 'model-x' }) },
+      },
+    })
+    ok('W20-RE3b: the production dispatcher creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
+    const c = agents.creates[0]
+    ok(
+      'W20-RE3b: the create carries both the model route and the set level',
+      c.agentOptions?.provider === 'prov-x' && c.agentOptions?.model === 'model-x' && c.agentOptions?.reasoningEffort === 'off',
+    )
+    ok('W20-RE3b: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+    eq('W20-RE3b: no warnings on the happy path', state.warns.length, 0)
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
+    const agents = makeAgentsService({ turnEnd: 'completed' })
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      services: { agents },
+    })
+    ok('W20-RE4: the production dispatcher creates the session', await waitFor(() => agents.creates.length >= 1, 4000))
+    ok('W20-RE4: without a level and no route source no agentOptions key is passed', !('agentOptions' in agents.creates[0]))
+    ok('W20-RE4: the session settles ok', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+    watcher.dispose()
   }, { folders: { INBOX: { messages: [] } } })
 }
 

@@ -55,6 +55,7 @@ const FIELDS = new Set([
   'TRIGGER_MAX_CONCURRENT',
   'TRIGGER_QUEUE_MAX',
   'TRIGGER_PRESET',
+  'TRIGGER_REASONING_EFFORT',
 ])
 
 /** The four fields whose absence drops the account. */
@@ -89,8 +90,18 @@ export const DEFAULT_TRIGGER_MAX_CONCURRENT = 1
 export const DEFAULT_TRIGGER_QUEUE_MAX = 100
 /** Default trigger listen folder. */
 export const DEFAULT_TRIGGER_FOLDER = 'INBOX'
+/**
+ * The closed level set of the trigger session's reasoning effort. Source: the
+ * framework's dsh-llm-pi-ai THINKING_LEVELS constant - the full
+ * set a provider/model may declare (a superset); the framework re-checks the
+ * per-model support of the route at first request. When the framework adds a
+ * level, all three plugins (dsh-email, dsh-timer, dsh-webhook-dispatcher)
+ * extend this set in sync (no shared package: the three copies stay in lock
+ * step, the spec in the repo's reports directory is the reference).
+ */
+export const REASONING_EFFORTS: readonly string[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
-/** The seven per-account trigger field suffixes (the trigger watcher surface). */
+/** The eight per-account trigger field suffixes (the trigger watcher surface). */
 const TRIGGER_FIELDS = new Set([
   'TRIGGER_ENABLE',
   'TRIGGER_PROMPT',
@@ -99,6 +110,7 @@ const TRIGGER_FIELDS = new Set([
   'TRIGGER_MAX_CONCURRENT',
   'TRIGGER_QUEUE_MAX',
   'TRIGGER_PRESET',
+  'TRIGGER_REASONING_EFFORT',
 ])
 
 interface RawAccount {
@@ -178,7 +190,7 @@ class TriggerFieldError extends Error {
 }
 
 /**
- * The single shared validator for the seven trigger fields:
+ * The single shared validator for the eight trigger fields:
  * both the env path and the config path materialize into the same record and
  * converge here at the watcher construction entry, so one function is the
  * only validation point. Rules: any present field is validated (a type or
@@ -187,8 +199,10 @@ class TriggerFieldError extends Error {
  * enable=true = the prompt must be present and non-blank, else malformed;
  * otherwise on with the defaults filled in (folder INBOX, idleMs
  * 600000, maxConcurrent 1, queueMax 100; idleMs floor 1000 = reject, not
- * clamp; preset optional = deployment default).
- * @param raw the raw materialized values of the seven fields (any type:
+ * clamp; preset optional = deployment default; reasoningEffort optional =
+ * the framework's provider default, present = the level must be a member of
+ * REASONING_EFFORTS).
+ * @param raw the raw materialized values of the eight fields (any type:
  * strings from env, stringified scalars or pass-through values from the
  * config layer; absent/undefined/null keys are treated as not set).
  * @returns the resolved trigger state of the account.
@@ -242,6 +256,15 @@ export function parseTriggerFields(raw: Record<string, unknown>): TriggerState {
       ? requirePositiveInt('TRIGGER_QUEUE_MAX', 1)
       : DEFAULT_TRIGGER_QUEUE_MAX
     const preset = 'TRIGGER_PRESET' in present ? requireString('TRIGGER_PRESET') : undefined
+    let reasoningEffort: string | undefined
+    if ('TRIGGER_REASONING_EFFORT' in present) {
+      const s = toStr(present.TRIGGER_REASONING_EFFORT)
+      if (s === null) throw new TriggerFieldError('TRIGGER_REASONING_EFFORT must be a string')
+      if (!REASONING_EFFORTS.includes(s)) {
+        throw new TriggerFieldError(`TRIGGER_REASONING_EFFORT "${s}" is not a valid level (${REASONING_EFFORTS.join('/')})`)
+      }
+      reasoningEffort = s
+    }
 
     if (!enable) return { kind: 'off' }
     if (prompt.trim() === '') {
@@ -249,7 +272,15 @@ export function parseTriggerFields(raw: Record<string, unknown>): TriggerState {
     }
     return {
       kind: 'on',
-      config: { prompt, folder, idleMs, maxConcurrent, queueMax, ...(preset !== undefined ? { preset } : {}) },
+      config: {
+        prompt,
+        folder,
+        idleMs,
+        maxConcurrent,
+        queueMax,
+        ...(preset !== undefined ? { preset } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      },
     }
   } catch (err) {
     return { kind: 'malformed', reason: err instanceof TriggerFieldError ? err.reason : errMsg(err) }
@@ -393,6 +424,7 @@ export interface DeliveredAccountConfig {
   triggerMaxConcurrent?: number
   triggerQueueMax?: number
   triggerPreset?: string
+  triggerReasoningEffort?: string
 }
 
 /**
@@ -431,6 +463,7 @@ const CONFIG_FIELD_TO_ENV: Record<string, string> = {
   triggerMaxConcurrent: 'TRIGGER_MAX_CONCURRENT',
   triggerQueueMax: 'TRIGGER_QUEUE_MAX',
   triggerPreset: 'TRIGGER_PRESET',
+  triggerReasoningEffort: 'TRIGGER_REASONING_EFFORT',
 }
 
 /**

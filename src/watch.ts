@@ -143,7 +143,7 @@ interface AgentsService {
   create(options: {
     sessionId: string
     meta?: Record<string, unknown>
-    agentOptions?: { provider?: string; model?: string }
+    agentOptions?: { provider?: string; model?: string; reasoningEffort?: string }
     setup?: (agentCtx: unknown, agent: unknown) => Promise<void>
   }): Promise<TriggerAgentHandle>
 }
@@ -236,15 +236,26 @@ async function readDefaultModelSelection(ctx: Context): Promise<DefaultModelSele
 }
 
 /**
- * The model route of the trigger session: no per-session model knob exists -
- * the deployment's default selection from the soft sources above when one
- * resolves; otherwise no route is passed and the framework's own no-route
- * rejection is surfaced at settlement.
+ * The agent options of the trigger session: the model route has no
+ * per-session knob - the deployment's default selection from the soft sources
+ * above when one resolves; the reasoning effort is the account's validated
+ * trigger value when set. Either may resolve to nothing; a create carries
+ * whichever is set, and when neither resolves no agentOptions key is passed
+ * (the framework's provider default applies; its own no-route rejection is
+ * surfaced at settlement).
  */
-async function resolveAgentOptions(ctx: Context): Promise<{ provider?: string; model?: string }> {
+async function resolveAgentOptions(
+  ctx: Context,
+  reasoningEffort?: string,
+): Promise<{ provider?: string; model?: string; reasoningEffort?: string }> {
   const selection = await readDefaultModelSelection(ctx)
-  if (!selection) return {}
-  return { provider: selection.provider, model: selection.model }
+  const out: { provider?: string; model?: string; reasoningEffort?: string } = {}
+  if (selection) {
+    out.provider = selection.provider
+    out.model = selection.model
+  }
+  if (reasoningEffort !== undefined) out.reasoningEffort = reasoningEffort
+  return out
 }
 
 /** The host's agent preset service, or undefined when the host provides none. */
@@ -405,7 +416,7 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
   if ('failed' in preset) {
     return { failed: 'create_failed', detail: preset.failed }
   }
-  const agentOptions = await resolveAgentOptions(ctx)
+  const agentOptions = await resolveAgentOptions(ctx, trigger.reasoningEffort)
   const workspace = await resolveTriggerWorkspace(ctx, logger)
 
   // The session meta mirrors every other in-process session creator in a

@@ -105,6 +105,7 @@ Per account (N = the account name uppercased):
 | `EMAIL_<N>_TRIGGER_MAX_CONCURRENT` | no | 1 | max concurrent trigger sessions on this account (1 = strictly serial) |
 | `EMAIL_<N>_TRIGGER_QUEUE_MAX` | no | 100 | max queued (waiting) new mails; overflow beyond active + queue is a visible log entry, the mail stays UNSEEN and is retried later |
 | `EMAIL_<N>_TRIGGER_PRESET` | no | none (the deployment default) | named agent preset the trigger sessions run under (an unresolvable name = the dispatch fails visibly, the mail stays UNSEEN, retried per heartbeat) |
+| `EMAIL_<N>_TRIGGER_REASONING_EFFORT` | no | none (the framework provider default) | the reasoning effort of the trigger sessions: a member of the closed set `off/minimal/low/medium/high/xhigh/max` (validated at load; the framework re-checks the per-model support of the route at first request; an invalid value = the account's trigger is malformed - boot warning, no watcher, the account stays usable) |
 
 Example (single self-hosted account):
 
@@ -125,7 +126,7 @@ An optional config layer sits on top of the env contract: a cordis patch entry t
 
 - `defaultAccount` - mirror of `EMAIL_DEFAULT_ACCOUNT`
 - `readBodyLimit` - positive integer, mirror of `EMAIL_READ_BODY_LIMIT`
-- `accounts` - a map of account name (same charset as the env account names) to per-account keys, camelCase mirrors of the `EMAIL_<N>_*` fields: `user`, `pass`, `imapHost`, `imapPort` (integer 1-65535), `imapSecure` (`tls` / `starttls` / `none`, case-insensitive), `imapAllowInsecureTls`, `smtpHost`, `smtpPort` (integer 1-65535), `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs` (positive integer ms), `triggerEnable` (boolean), `triggerPrompt` (string), `triggerFolder` (string), `triggerIdleMs` (positive integer ms, lower bound 1000), `triggerMaxConcurrent` (positive integer), `triggerQueueMax` (positive integer), `triggerPreset` (string, optional)
+- `accounts` - a map of account name (same charset as the env account names) to per-account keys, camelCase mirrors of the `EMAIL_<N>_*` fields: `user`, `pass`, `imapHost`, `imapPort` (integer 1-65535), `imapSecure` (`tls` / `starttls` / `none`, case-insensitive), `imapAllowInsecureTls`, `smtpHost`, `smtpPort` (integer 1-65535), `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs` (positive integer ms), `triggerEnable` (boolean), `triggerPrompt` (string), `triggerFolder` (string), `triggerIdleMs` (positive integer ms, lower bound 1000), `triggerMaxConcurrent` (positive integer), `triggerQueueMax` (positive integer), `triggerPreset` (string, optional), `triggerReasoningEffort` (string, optional, closed set off/minimal/low/medium/high/xhigh/max)
 
 Example:
 

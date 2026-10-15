@@ -57,6 +57,7 @@ restart. One account needs four variables, the rest are optional:
 | `EMAIL_<N>_TRIGGER_MAX_CONCURRENT` | no | max concurrent trigger sessions, default 1 |
 | `EMAIL_<N>_TRIGGER_QUEUE_MAX` | no | max queued new mails, default 100 (overflow stays UNSEEN and is retried) |
 | `EMAIL_<N>_TRIGGER_PRESET` | no | named agent preset for trigger sessions; absent = the deployment default |
+| `EMAIL_<N>_TRIGGER_REASONING_EFFORT` | no | the reasoning effort of the trigger sessions: a member of the closed set `off/minimal/low/medium/high/xhigh/max` (validated at load; an invalid value makes the trigger malformed - warned, no watcher, the account stays usable; the framework re-checks the per-model support of the route at first request); absent = the framework provider default |
 | `EMAIL_DEFAULT_ACCOUNT` | no | the account used when a call names no account |
 | `EMAIL_READ_BODY_LIMIT` | no | read body truncation budget in characters, default 20000 |
 | `EMAIL_OFFLOAD_BATCH` | no | per-sweep offload budget (max trigger sessions one sweep may move to the archive), default 50; an invalid value warns and falls back to 50, never disables the sweep |
@@ -76,7 +77,7 @@ EMAIL_LOCAL_SENT_FOLDER=Sent
 
 ### Config layer (cordis patch)
 
-An optional config layer sits on top of the env block: a patch entry targeting the plugin id `dsh-email` (the profile's `cordis.patch.yml`, the user-global `~/.dsh/cordis.patch.yml`, or a `--patch` overlay) carries a `config` object whose keys are camelCase mirrors of the env fields - `defaultAccount`, `readBodyLimit`, and `accounts` (a map of account name to `user`, `pass`, `imapHost`, `imapPort`, `imapSecure`, `imapAllowInsecureTls`, `smtpHost`, `smtpPort`, `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs`, plus the trigger fields `triggerEnable`, `triggerPrompt`, `triggerFolder`, `triggerIdleMs`, `triggerMaxConcurrent`, `triggerQueueMax`, `triggerPreset`). Every key is optional.
+An optional config layer sits on top of the env block: a patch entry targeting the plugin id `dsh-email` (the profile's `cordis.patch.yml`, the user-global `~/.dsh/cordis.patch.yml`, or a `--patch` overlay) carries a `config` object whose keys are camelCase mirrors of the env fields - `defaultAccount`, `readBodyLimit`, and `accounts` (a map of account name to `user`, `pass`, `imapHost`, `imapPort`, `imapSecure`, `imapAllowInsecureTls`, `smtpHost`, `smtpPort`, `smtpSecure`, `smtpAllowInsecureTls`, `from`, `fromName`, `sentFolder`, `sentFolderAutocreate`, `allowDelete`, `timeoutMs`, plus the trigger fields `triggerEnable`, `triggerPrompt`, `triggerFolder`, `triggerIdleMs`, `triggerMaxConcurrent`, `triggerQueueMax`, `triggerPreset`, `triggerReasoningEffort`). Every key is optional.
 
 ```yaml
 - id: dsh-email
@@ -112,6 +113,7 @@ EMAIL_LOCAL_TRIGGER_MAX_CONCURRENT=1
 Each session receives a three-part prompt (no body excerpt): a type label naming account + folder, one envelope line (`uid | INTERNALDATE | From: | Subject:`), and the `TRIGGER_PROMPT` verbatim under a `Policy:` block. The session's execution rules (read the message, act on the policy, mark the message seen, summarize) live in the skill's "Trigger session" section.
 
 - Dispatch state: up to `TRIGGER_MAX_CONCURRENT` sessions run at once; newer mails wait in a FIFO queue of at most `TRIGGER_QUEUE_MAX`; beyond that the overflow is a visible log entry and the mail simply stays UNSEEN (retried on a later resync).
+- Session route: each trigger session is created with the deployment's default model route when one resolves; `TRIGGER_REASONING_EFFORT` sets the session's reasoning effort (closed set, absent = the framework provider default), passed through to the framework's agent options.
 - Mark-seen is the session's job (via the `email` tool), not the watcher's. A session that settles without marking seen (or whose dispatch failed) is re-dispatched on the next resync - an idempotent replay, the designed behavior.
 - Failure modes all fail visible and self-heal: connect / command failures close the connection and reconnect through an exponential backoff (5s x 2, capped at 60s), then resync on the fresh connection (new mail that arrived in the meantime is picked up); a queue overflow, a failed dispatch (agents service missing, unresolvable preset, turn error) and a missing EXAMINE folder are visible log entries. The only non-self-healing state is the missing watched folder (the watcher stops and waits for the setting or the folder to change).
 - Trigger accounts without the `agents` service on the host (or with a malformed trigger configuration) start no watcher: the account stays fully usable through every mail verb, zero connections.

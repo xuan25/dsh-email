@@ -60,6 +60,8 @@ const ACCOUNT_FIELDS = {
   triggerMaxConcurrent: 'max concurrent trigger sessions on this account (default 1)',
   triggerQueueMax: 'max queued (waiting) new mails before visible overflow; overflow stays UNSEEN (default 100)',
   triggerPreset: 'named agent preset for trigger sessions (default: the deployment default)',
+  triggerReasoningEffort:
+    'the trigger session reasoning effort, a member of the closed level set off/minimal/low/medium/high/xhigh/max (default: the framework provider default; the framework re-checks the per-model support at first request; an invalid level makes the account trigger malformed - warned, the account stays usable)',
 } as const
 
 /** The label of the per-account schema in validation messages. */
@@ -112,7 +114,7 @@ const ACCOUNT_CONFIG = rejectUnknownKeys(
     sentFolderAutocreate: Schema.boolean().description(ACCOUNT_FIELDS.sentFolderAutocreate),
     allowDelete: Schema.boolean().description(ACCOUNT_FIELDS.allowDelete),
     timeoutMs: Schema.number().min(1).step(1).description(ACCOUNT_FIELDS.timeoutMs),
-    // The seven trigger fields are deliberately unconstrained at the schema
+    // The eight trigger fields are deliberately unconstrained at the schema
     // layer (Schema.any(), zero constraints): a type declaration here would
     // fail the entry loudly on a config-layer type mismatch at boot, while
     // the runtime validator (parseTriggerFields in config.ts, the single
@@ -125,6 +127,7 @@ const ACCOUNT_CONFIG = rejectUnknownKeys(
     triggerMaxConcurrent: Schema.any().description(ACCOUNT_FIELDS.triggerMaxConcurrent),
     triggerQueueMax: Schema.any().description(ACCOUNT_FIELDS.triggerQueueMax),
     triggerPreset: Schema.any().description(ACCOUNT_FIELDS.triggerPreset),
+    triggerReasoningEffort: Schema.any().description(ACCOUNT_FIELDS.triggerReasoningEffort),
   }),
   ACCOUNT_CONFIG_LABEL,
 )
