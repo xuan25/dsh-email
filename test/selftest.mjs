@@ -2358,7 +2358,7 @@ async function withServer(start, fn) {
   }
   for (const f of ['README.md', path.join('skill', 'dsh-email', 'SKILL.md'), 'cordis.patch.yml', 'package.json']) {
     const src = readFileSync(path.join(PKG, f), 'utf8')
-    ok(`shipped file: ${f} is ASCII-clean`, !CJK_RE.test(src))
+    ok(`shipped file: ${f} is ASCII-clean`, /^[\x00-\x7F]*$/.test(src))
   }
 }
 {
@@ -2369,7 +2369,7 @@ async function withServer(start, fn) {
       const p = path.join(dir, e)
       const st = statSync(p)
       if (st.isDirectory()) walk(p)
-      else if (st.isFile()) ok(`ascii sweep: ${path.relative(PKG, p)} carries no CJK`, !CJK_RE.test(readFileSync(p, 'utf8')))
+      else if (st.isFile()) ok(`ascii sweep: ${path.relative(PKG, p)} is strict ASCII`, /^[\x00-\x7F]*$/.test(readFileSync(p, 'utf8')))
     }
   }
   walk(PKG)
@@ -3030,7 +3030,7 @@ async function withServer(start, fn) {
 // 32. session offload: retention window parser, retention log, the sweep
 //     (round health, window semantics, the source/destination existence
 //     table, liveness gate and its rollback, the budget, compaction, trend
-//     alert) and the plugin integration write gate (O1-O9)
+//     alert) and the plugin integration write gate (the ten sections, from window through logfault)
 // ---------------------------------------------------------------------------
 {
   // A fake sessionPersistence service: locate() mirrors the framework jsonl
@@ -3112,79 +3112,79 @@ async function withServer(start, fn) {
     }
   }
 
-  // -- O1: the retention window parser (number = ms; string = 1-2 segments
+  // -- window: the retention window parser (number = ms; string = 1-2 segments
   //        in descending unit order; the discriminating vectors rejected)
-  eq('O1a: number windows are non-negative integer ms', [parseWindowMs(0).ms, parseWindowMs(900000).ms], [0, 900000])
-  ok('O1a: a negative, fractional or NaN number window is invalid', !parseWindowMs(-1).ok && !parseWindowMs(1.5).ok && !parseWindowMs(Number.NaN).ok)
-  eq('O1b: one-segment duration strings', [parseWindowMs('1d').ms, parseWindowMs('24h').ms, parseWindowMs('30m').ms, parseWindowMs('90s').ms, parseWindowMs('5000ms').ms], [86_400_000, 86_400_000, 1_800_000, 90_000, 5000])
-  eq('O1b: two-segment durations in descending unit order', [parseWindowMs('1h30m').ms, parseWindowMs('4h30m').ms, parseWindowMs('1m30s').ms, parseWindowMs('1s500ms').ms], [5_400_000, 16_200_000, 90_000, 1500])
+  eq('window-a: number windows are non-negative integer ms', [parseWindowMs(0).ms, parseWindowMs(900000).ms], [0, 900000])
+  ok('window-a: a negative, fractional or NaN number window is invalid', !parseWindowMs(-1).ok && !parseWindowMs(1.5).ok && !parseWindowMs(Number.NaN).ok)
+  eq('window-b: one-segment duration strings', [parseWindowMs('1d').ms, parseWindowMs('24h').ms, parseWindowMs('30m').ms, parseWindowMs('90s').ms, parseWindowMs('5000ms').ms], [86_400_000, 86_400_000, 1_800_000, 90_000, 5000])
+  eq('window-b: two-segment durations in descending unit order', [parseWindowMs('1h30m').ms, parseWindowMs('4h30m').ms, parseWindowMs('1m30s').ms, parseWindowMs('1s500ms').ms], [5_400_000, 16_200_000, 90_000, 1500])
   ok(
-    'O1c: the discriminating vectors are all invalid (strict segment grammar)',
+    'window-c: the discriminating vectors are all invalid (strict segment grammar)',
     ['1h30m30s', '30m4h', '1w', '1h 30m', '30', '5000', 'h', '24H', '1ms2s', '1w30m', 'banana', ''].every((v) => !parseWindowMs(v).ok),
   )
-  ok('O1c: the range guard rejects overflow', !parseWindowMs('900000000d').ok)
+  ok('window-c: the range guard rejects overflow', !parseWindowMs('900000000d').ok)
 
-  // -- O2: the retention log (round trip, single append write per line, the
+  // -- retlog: the retention log (round trip, single append write per line, the
   //        torn-tail repair, the bad-line skip, the atomic rewrite)
   {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
     try {
       const log = path.join(dir, 'sub', 'retention-log.jsonl')
       const r0 = await readRetentionLog(log)
-      eq('O2a: reading a missing log is an empty, un-repaired read', [r0.entries.length, r0.repaired, r0.badLines], [0, false, 0])
+      eq('retlog-a: reading a missing log is an empty, un-repaired read', [r0.entries.length, r0.repaired, r0.badLines], [0, false, 0])
       await appendRetentionEntry(log, { id: 'a', createdAt: iso(1), unit: 'u1', cwd: '/x/w' })
       await appendRetentionEntry(log, { id: 'b', createdAt: iso(2), unit: 'u2' })
       const lines = readFileSync(log, 'utf8').split('\n')
-      eq('O2a: each append is exactly one complete line (single write per line)', lines.filter((l) => l !== '').length, 2)
-      ok('O2a: the cwd key is present for the first line and omitted for the second', lines[0].includes('"cwd":"/x/w"') && !lines[1].includes('cwd'))
+      eq('retlog-a: each append is exactly one complete line (single write per line)', lines.filter((l) => l !== '').length, 2)
+      ok('retlog-a: the cwd key is present for the first line and omitted for the second', lines[0].includes('"cwd":"/x/w"') && !lines[1].includes('cwd'))
       const r1 = await readRetentionLog(log)
-      eq('O2a: the round trip preserves the entry shape and order', JSON.stringify(r1.entries), JSON.stringify([{ id: 'a', createdAt: iso(1), unit: 'u1', cwd: '/x/w' }, { id: 'b', createdAt: iso(2), unit: 'u2' }]))
+      eq('retlog-a: the round trip preserves the entry shape and order', JSON.stringify(r1.entries), JSON.stringify([{ id: 'a', createdAt: iso(1), unit: 'u1', cwd: '/x/w' }, { id: 'b', createdAt: iso(2), unit: 'u2' }]))
       const torn = path.join(dir, 'torn.jsonl')
       writeFileSync(torn, `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\n{"id":"p","createdAt":"${iso(2)}","unit":"u"`)
       const rt = await readRetentionLog(torn)
-      ok('O2b: a torn trailing line is repaired in place (back to the last newline)', rt.repaired === true && rt.entries.length === 1 && readFileSync(torn, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\n`)
+      ok('retlog-b: a torn trailing line is repaired in place (back to the last newline)', rt.repaired === true && rt.entries.length === 1 && readFileSync(torn, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\n`)
       await appendRetentionEntry(torn, { id: 'c', createdAt: iso(3), unit: 'u' })
-      ok('O2b: an append after the repair lands on its own line', readFileSync(torn, 'utf8').endsWith(`{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n`))
+      ok('retlog-b: an append after the repair lands on its own line', readFileSync(torn, 'utf8').endsWith(`{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n`))
       const torn2 = path.join(dir, 'torn2.jsonl')
       writeFileSync(torn2, `{"id":"a","createdAt":"${iso(1)}","unit":"u"`) // no trailing newline
       await appendRetentionEntry(torn2, { id: 'c', createdAt: iso(3), unit: 'u' })
       const rt2 = await readRetentionLog(torn2)
-      ok('O2b: an append to a torn tail closes it first (the new line stays parseable)', readFileSync(torn2, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"\n{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n` && [rt2.entries.length, rt2.badLines, rt2.repaired].join() === '1,1,false')
+      ok('retlog-b: an append to a torn tail closes it first (the new line stays parseable)', readFileSync(torn2, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"u"\n{"id":"c","createdAt":"${iso(3)}","unit":"u"}\n` && [rt2.entries.length, rt2.badLines, rt2.repaired].join() === '1,1,false')
       const bad = path.join(dir, 'bad.jsonl')
       writeFileSync(bad, `{"id":"a","createdAt":"${iso(1)}","unit":"u"}\nnot json\n{"id":"b","createdAt":"${iso(2)}","unit":"u"}\n`)
       const rb = await readRetentionLog(bad)
-      eq('O2c: unparseable lines are skipped and counted', [rb.entries.length, rb.badLines, rb.repaired], [2, 1, false])
+      eq('retlog-c: unparseable lines are skipped and counted', [rb.entries.length, rb.badLines, rb.repaired], [2, 1, false])
       await rewriteRetentionLog(log, [r1.entries[1]])
       const r2 = await readRetentionLog(log)
-      eq('O2d: the compaction rewrite keeps exactly the survivors, in order', r2.entries.map((e) => e.id), ['b'])
-      ok('O2d: no temp file remains after the rewrite', !existsSync(`${log}.tmp`))
+      eq('retlog-d: the compaction rewrite keeps exactly the survivors, in order', r2.entries.map((e) => e.id), ['b'])
+      ok('retlog-d: no temp file remains after the rewrite', !existsSync(`${log}.tmp`))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   }
 
-  // -- O3: the config channel (the env-only window, the batch knob, the
+  // -- knob: the config channel (the env-only window, the batch knob, the
   //        warn-and-keep degradations)
   {
     const base = { EMAIL_MAIN_USER: 'u@example.com', EMAIL_MAIN_PASS: 'p', EMAIL_MAIN_IMAP_HOST: 'h', EMAIL_MAIN_SMTP_HOST: 'h' }
     const c1 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: '24h' }, () => {})
-    eq('O3a: a valid window resolves to ms on the account', c1.accounts[0].sessionRetentionMs, 86_400_000)
+    eq('knob-a: a valid window resolves to ms on the account', c1.accounts[0].sessionRetentionMs, 86_400_000)
     const c2 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: '4h30m', EMAIL_OFFLOAD_BATCH: '7' }, () => {})
-    eq('O3a: a two-segment window and a valid batch knob', [c2.accounts[0].sessionRetentionMs, c2.offloadBatch], [16_200_000, 7])
+    eq('knob-a: a two-segment window and a valid batch knob', [c2.accounts[0].sessionRetentionMs, c2.offloadBatch], [16_200_000, 7])
     const warns = []
     const c3 = parseEnv({ ...base, EMAIL_MAIN_SESSION_RETENTION: 'banana' }, (m) => warns.push(m))
-    ok('O3b: an invalid window warns and resolves to 0 (the account is kept)', c3.accounts[0].sessionRetentionMs === 0 && c3.accounts.length === 1 && warns.some((m) => m.includes('SESSION_RETENTION')))
+    ok('knob-b: an invalid window warns and resolves to 0 (the account is kept)', c3.accounts[0].sessionRetentionMs === 0 && c3.accounts.length === 1 && warns.some((m) => m.includes('SESSION_RETENTION')))
     const c4 = parseEnv(base, () => {})
-    eq('O3c: an absent window and an absent knob fall back silently', [c4.accounts[0].sessionRetentionMs, c4.offloadBatch], [0, 50])
+    eq('knob-c: an absent window and an absent knob fall back silently', [c4.accounts[0].sessionRetentionMs, c4.offloadBatch], [0, 50])
     const warns3 = []
     for (const v of ['0', '-2', 'abc']) {
       parseEnv({ ...base, EMAIL_OFFLOAD_BATCH: v }, (m) => warns3.push(m))
     }
     const c5 = parseEnv({ ...base, EMAIL_OFFLOAD_BATCH: '0' }, () => {})
-    ok('O3d: an invalid knob warns and falls back to the default (the component stays on)', warns3.length === 3 && warns3.every((m) => m.includes('OFFLOAD_BATCH')) && c5.offloadBatch === 50)
+    ok('knob-d: an invalid knob warns and falls back to the default (the component stays on)', warns3.length === 3 && warns3.every((m) => m.includes('OFFLOAD_BATCH')) && c5.offloadBatch === 50)
   }
 
-  // -- O4: round health (the disabled branches: unreachable service, missing
+  // -- health: round health (the disabled branches: unreachable service, missing
   //        store root, the mount mismatch; the registry fallback)
   {
     await runCase(
@@ -3193,8 +3193,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, services: {} })
       },
       ({ report, state }) => {
-        ok('O4a: an unreachable persistence service skips the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('persistence service is unreachable')))
-        eq('O4a: the skipped round performs no action', [report.candidates, report.offloaded, report.balance], [0, 0, 0])
+        ok('health-a: an unreachable persistence service skips the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('persistence service is unreachable')))
+        eq('health-a: the skipped round performs no action', [report.candidates, report.offloaded, report.balance], [0, 0, 0])
       },
     )
     await runCase(
@@ -3203,7 +3203,7 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot) } })
       },
       ({ report, state }) => {
-        ok('O4b: a missing store root disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('store root is missing')))
+        ok('health-b: a missing store root disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('store root is missing')))
       },
     )
     await runCase(
@@ -3216,7 +3216,7 @@ async function withServer(start, fn) {
         })
       },
       ({ report, state }) => {
-        ok('O4c: a mount mismatch disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('different mounts')))
+        ok('health-c: a mount mismatch disables the round with a warning', report.disabled !== undefined && state.warns.some((m) => m.includes('different mounts')))
       },
     )
     await runCase(
@@ -3233,7 +3233,7 @@ async function withServer(start, fn) {
         return handles
       },
       ({ report, state }) => {
-        ok('O4d: an unreachable registry falls back to the in-flight set with a warning', report.offloaded === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
+        ok('health-d: an unreachable registry falls back to the in-flight set with a warning', report.offloaded === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
       },
     )
     await runCase(
@@ -3252,13 +3252,13 @@ async function withServer(start, fn) {
         return handles
       },
       async ({ report, state, logPath }) => {
-        ok('O4d: with the registry unreachable the in-flight set alone gates liveness', report.skippedLive === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
-        eq('O4d: the live entry stays in the log', (await readRetentionLog(logPath)).entries.length, 1)
+        ok('health-d: with the registry unreachable the in-flight set alone gates liveness', report.skippedLive === 1 && state.warns.some((m) => m.includes('registry service is unreachable')))
+        eq('health-d: the live entry stays in the log', (await readRetentionLog(logPath)).entries.length, 1)
       },
     )
   }
 
-  // -- O5: the sweep core (window semantics, the existence table, the
+  // -- sweep: the sweep core (window semantics, the existence table, the
   //        liveness rollback, the retry, the unit-gone rule)
   {
     // Cell 1: source present, destination absent (the normal path).
@@ -3270,9 +3270,9 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, storeRoot, archiveDir, logPath }) => {
-        eq('O5a: the over-window settled session is offloaded', [report.offloaded, report.candidates], [1, 1])
-        ok('O5a: the session dir left the store and entered the archive', !existsSync(path.join(storeRoot, 'a', 'c1')) && existsSync(path.join(archiveDir, 'c1')))
-        eq('O5a: the completed line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('sweep-a: the over-window settled session is offloaded', [report.offloaded, report.candidates], [1, 1])
+        ok('sweep-a: the session dir left the store and entered the archive', !existsSync(path.join(storeRoot, 'a', 'c1')) && existsSync(path.join(archiveDir, 'c1')))
+        eq('sweep-a: the completed line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
       },
     )
     // Cell 2: neither side (the session was cleaned up externally).
@@ -3283,8 +3283,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, logPath }) => {
-        eq('O5b: a session found on neither side completes without action', [report.sourceGone, report.offloaded], [1, 0])
-        eq('O5b: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('sweep-b: a session found on neither side completes without action', [report.sourceGone, report.offloaded], [1, 0])
+        eq('sweep-b: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
       },
     )
     // Cell 3: destination present, source absent (an earlier round already moved it).
@@ -3296,8 +3296,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, logPath }) => {
-        eq('O5c: a session already in the archive completes without action', [report.alreadyArchived, report.offloaded], [1, 0])
-        eq('O5c: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('sweep-c: a session already in the archive completes without action', [report.alreadyArchived, report.offloaded], [1, 0])
+        eq('sweep-c: its line is removed by the compaction rewrite', (await readRetentionLog(logPath)).entries.length, 0)
       },
     )
     // Cell 4: both sides present (a deployment anomaly: neither side is touched).
@@ -3310,9 +3310,9 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, storeRoot, archiveDir, logPath, state }) => {
-        eq('O5d: a both-sides-present session is an error, both sides untouched', [report.errors, report.offloaded], [1, 0])
-        ok('O5d: the anomaly is logged for manual resolution', state.warns.some((m) => m.includes('c4') && m.includes('manual resolution')))
-        ok('O5d: both sides still exist and the line survives the round', existsSync(path.join(storeRoot, 'a', 'c4')) && existsSync(path.join(archiveDir, 'c4')) && (await readRetentionLog(logPath)).entries.length === 1)
+        eq('sweep-d: a both-sides-present session is an error, both sides untouched', [report.errors, report.offloaded], [1, 0])
+        ok('sweep-d: the anomaly is logged for manual resolution', state.warns.some((m) => m.includes('c4') && m.includes('manual resolution')))
+        ok('sweep-d: both sides still exist and the line survives the round', existsSync(path.join(storeRoot, 'a', 'c4')) && existsSync(path.join(archiveDir, 'c4')) && (await readRetentionLog(logPath)).entries.length === 1)
       },
     )
     // A rename failure (EIO): the entry is kept and the next round retries.
@@ -3326,9 +3326,9 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
       },
       async ({ report, storeRoot, logPath, state }) => {
-        eq('O5e: a failed rename keeps the entry and the source', [report.errors, report.offloaded], [1, 0])
-        ok('O5e: the failure is logged and the retry is announced', state.warns.some((m) => m.includes('eio') && m.includes('retried next round')))
-        ok('O5e: the source dir is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eio')) && (await readRetentionLog(logPath)).entries.length === 1)
+        eq('sweep-e: a failed rename keeps the entry and the source', [report.errors, report.offloaded], [1, 0])
+        ok('sweep-e: the failure is logged and the retry is announced', state.warns.some((m) => m.includes('eio') && m.includes('retried next round')))
+        ok('sweep-e: the source dir is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eio')) && (await readRetentionLog(logPath)).entries.length === 1)
       },
     )
     await runCase(
@@ -3339,8 +3339,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       ({ report, archiveDir }) => {
-        eq('O5e: the next round (failure gone) offloads the same entry', [report.offloaded, report.errors], [1, 0])
-        ok('O5e: the retry landed in the archive', existsSync(path.join(archiveDir, 'eio')))
+        eq('sweep-e: the next round (failure gone) offloads the same entry', [report.offloaded, report.errors], [1, 0])
+        ok('sweep-e: the retry landed in the archive', existsSync(path.join(archiveDir, 'eio')))
       },
     )
     // A rename that reports ENOENT (the source vanished between the check and the move).
@@ -3354,8 +3354,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
       },
       async ({ report, logPath }) => {
-        eq('O5f: a rename ENOENT converges to source-gone', [report.sourceGone, report.errors], [1, 0])
-        eq('O5f: the entry completed and its line was removed', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('sweep-f: a rename ENOENT converges to source-gone', [report.sourceGone, report.errors], [1, 0])
+        eq('sweep-f: the entry completed and its line was removed', (await readRetentionLog(logPath)).entries.length, 0)
       },
     )
     // A rename that reports EEXIST with the source gone (an earlier round moved it).
@@ -3369,8 +3369,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: async (s) => { rmSync(s, { recursive: true, force: true }); throw err } })
       },
       async ({ report, logPath }) => {
-        eq('O5g: an EEXIST with the source gone means the offload already happened', [report.alreadyArchived, report.errors], [1, 0])
-        eq('O5g: the entry completed', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('sweep-g: an EEXIST with the source gone means the offload already happened', [report.alreadyArchived, report.errors], [1, 0])
+        eq('sweep-g: the entry completed', (await readRetentionLog(logPath)).entries.length, 0)
       },
     )
     // A rename that reports EEXIST with the source still present (a true conflict).
@@ -3384,8 +3384,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0, move: () => Promise.reject(err) })
       },
       async ({ report, storeRoot, logPath }) => {
-        eq('O5g: an EEXIST with the source present is an error, both sides kept', [report.errors, report.offloaded], [1, 0])
-        ok('O5g: the source is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eex')) && (await readRetentionLog(logPath)).entries.length === 1)
+        eq('sweep-g: an EEXIST with the source present is an error, both sides kept', [report.errors, report.offloaded], [1, 0])
+        ok('sweep-g: the source is intact and the line survives', existsSync(path.join(storeRoot, 'a', 'eex')) && (await readRetentionLog(logPath)).entries.length === 1)
       },
     )
     // The locate call itself throws (a broken persistence backend).
@@ -3397,9 +3397,9 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: broken, sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, logPath, state }) => {
-        eq('O5h: a locate failure keeps the entry for the next round', [report.errors, report.offloaded], [1, 0])
-        ok('O5h: the failure is logged with the session id', state.warns.some((m) => m.includes('locating session loc failed')))
-        eq('O5h: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
+        eq('sweep-h: a locate failure keeps the entry for the next round', [report.errors, report.offloaded], [1, 0])
+        ok('sweep-h: the failure is logged with the session id', state.warns.some((m) => m.includes('locating session loc failed')))
+        eq('sweep-h: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
       },
     )
     // The liveness rollback: the session goes live between the gate and the move.
@@ -3427,9 +3427,9 @@ async function withServer(start, fn) {
         }
       },
       async ({ report, storeRoot, archiveDir, logPath }) => {
-        eq('O5i: a session that goes live in the gap is neither offloaded nor an error', [report.offloaded, report.errors, report.skippedLive], [0, 0, 0])
-        ok('O5i: the rollback moved the session back to the store', existsSync(path.join(storeRoot, 'a', 'rb')) && !existsSync(path.join(archiveDir, 'rb')))
-        eq('O5i: the entry is kept for the next round', (await readRetentionLog(logPath)).entries.length, 1)
+        eq('sweep-i: a session that goes live in the gap is neither offloaded nor an error', [report.offloaded, report.errors, report.skippedLive], [0, 0, 0])
+        ok('sweep-i: the rollback moved the session back to the store', existsSync(path.join(storeRoot, 'a', 'rb')) && !existsSync(path.join(archiveDir, 'rb')))
+        eq('sweep-i: the entry is kept for the next round', (await readRetentionLog(logPath)).entries.length, 1)
       },
     )
     // The unit-gone rule: no age check, the liveness gate still applies.
@@ -3441,8 +3441,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       ({ report, archiveDir }) => {
-        eq('O5j: a vanished unit is offloaded immediately, regardless of age', [report.offloaded, report.candidates], [1, 1])
-        ok('O5j: the fresh (within-window-age) session was moved', existsSync(path.join(archiveDir, 'ug')))
+        eq('sweep-j: a vanished unit is offloaded immediately, regardless of age', [report.offloaded, report.candidates], [1, 1])
+        ok('sweep-j: the fresh (within-window-age) session was moved', existsSync(path.join(archiveDir, 'ug')))
       },
     )
     await runCase(
@@ -3454,7 +3454,7 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: reg }, now: () => T0 })
       },
       ({ report }) => {
-        eq('O5j: the liveness gate still applies to a vanished unit', [report.skippedLive, report.offloaded], [1, 0])
+        eq('sweep-j: the liveness gate still applies to a vanished unit', [report.skippedLive, report.offloaded], [1, 0])
       },
     )
     // The window-0 unit (retention closed): entries are kept, never candidates.
@@ -3466,8 +3466,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: new Map([['cold', 0]]), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       async ({ report, logPath }) => {
-        eq('O5k: a window-0 unit keeps even ancient entries', [report.candidates, report.offloaded], [0, 0])
-        eq('O5k: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
+        eq('sweep-k: a window-0 unit keeps even ancient entries', [report.candidates, report.offloaded], [0, 0])
+        eq('sweep-k: the line survives', (await readRetentionLog(logPath)).entries.length, 1)
       },
     )
     // Reopening the window re-manages the retained entries (over-window
@@ -3482,8 +3482,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       ({ report, archiveDir, storeRoot }) => {
-        eq('O5l: the reopened window offloads the over-window entries and keeps the fresh one', [report.offloaded, report.candidates], [1, 1])
-        ok('O5l: the over-window session is archived, the fresh one stays in the store', existsSync(path.join(archiveDir, 'old')) && existsSync(path.join(storeRoot, 'a', 'new')))
+        eq('sweep-l: the reopened window offloads the over-window entries and keeps the fresh one', [report.offloaded, report.candidates], [1, 1])
+        ok('sweep-l: the over-window session is archived, the fresh one stays in the store', existsSync(path.join(archiveDir, 'old')) && existsSync(path.join(storeRoot, 'a', 'new')))
       },
     )
     // A cwd-less entry resolves through the _no-cwd project dir.
@@ -3495,8 +3495,8 @@ async function withServer(start, fn) {
         return makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
       },
       ({ report, archiveDir }) => {
-        eq('O5m: a cwd-less entry is offloaded through the no-cwd project dir', [report.offloaded, report.errors], [1, 0])
-        ok('O5m: the archive copy is named after the session id', existsSync(path.join(archiveDir, 'nc')))
+        eq('sweep-m: a cwd-less entry is offloaded through the no-cwd project dir', [report.offloaded, report.errors], [1, 0])
+        ok('sweep-m: the archive copy is named after the session id', existsSync(path.join(archiveDir, 'nc')))
       },
     )
     // The archive dir is rebuilt after external deletion (the next round heals).
@@ -3515,13 +3515,13 @@ async function withServer(start, fn) {
         return handles
       },
       ({ report, archiveDir }) => {
-        eq('O5n: after the archive dir was deleted externally the next round rebuilds it and continues', [report.offloaded, report.errors], [1, 0])
-        ok('O5n: the rebuilt archive holds the new offload', existsSync(path.join(archiveDir, 'h3')))
+        eq('sweep-n: after the archive dir was deleted externally the next round rebuilds it and continues', [report.offloaded, report.errors], [1, 0])
+        ok('sweep-n: the rebuilt archive holds the new offload', existsSync(path.join(archiveDir, 'h3')))
       },
     )
   }
 
-  // -- O6: the per-sweep budget (file order, the oldest-first identity, the
+  // -- budget: the per-sweep budget (file order, the oldest-first identity, the
   //        knob, the compaction regimes, sweep idempotency)
   {
     // 51 candidates with the default cap of 50: the first round takes the
@@ -3539,11 +3539,11 @@ async function withServer(start, fn) {
         }
         const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
         const first = await sweeper.sweep()
-        eq('O6a: the first round offloads exactly the budget', [first.offloaded, first.candidates], [50, 50])
-        eq('O6a: the identity is the fifty oldest entries, in file order', JSON.stringify((await readRetentionLog(logPath)).entries.map((e) => e.id)), JSON.stringify(['n50']))
+        eq('budget-a: the first round offloads exactly the budget', [first.offloaded, first.candidates], [50, 50])
+        eq('budget-a: the identity is the fifty oldest entries, in file order', JSON.stringify((await readRetentionLog(logPath)).entries.map((e) => e.id)), JSON.stringify(['n50']))
         const second = await sweeper.sweep()
-        eq('O6a: the second round offloads the single remainder', [second.offloaded, second.candidates], [1, 1])
-        eq('O6a: the log is empty after both rounds', (await readRetentionLog(logPath)).entries.length, 0)
+        eq('budget-a: the second round offloads the single remainder', [second.offloaded, second.candidates], [1, 1])
+        eq('budget-a: the log is empty after both rounds', (await readRetentionLog(logPath)).entries.length, 0)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3561,9 +3561,9 @@ async function withServer(start, fn) {
         }
         const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), cap: 3, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
         const first = await sweeper.sweep()
-        eq('O6b: a valid knob value caps the round', [first.offloaded, first.candidates], [3, 3])
+        eq('budget-b: a valid knob value caps the round', [first.offloaded, first.candidates], [3, 3])
         const second = await sweeper.sweep()
-        eq('O6b: the remainder drains on the next round', second.offloaded, 2)
+        eq('budget-b: the remainder drains on the next round', second.offloaded, 2)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3583,10 +3583,10 @@ async function withServer(start, fn) {
         }
         const { sweeper } = makeSweeper(home, { storeRoot, accounts: mapMain(), services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }, now: () => T0 })
         const first = await sweeper.sweep()
-        eq('O6c: the rate within the budget drains the file in one round', [first.offloaded, first.removedLines, first.balance], [30, 30, 0])
-        eq('O6c: the compaction ratio triggered the rewrite', first.completedRatio, 1)
+        eq('budget-c: the rate within the budget drains the file in one round', [first.offloaded, first.removedLines, first.balance], [30, 30, 0])
+        eq('budget-c: the compaction ratio triggered the rewrite', first.completedRatio, 1)
         const second = await sweeper.sweep()
-        eq('O6c: the next round is a zero-action no-op (sweep idempotency)', [second.candidates, second.offloaded, second.removedLines, second.balance, second.increment], [0, 0, 0, 0, 0])
+        eq('budget-c: the next round is a zero-action no-op (sweep idempotency)', [second.candidates, second.offloaded, second.removedLines, second.balance, second.increment], [0, 0, 0, 0, 0])
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3611,16 +3611,16 @@ async function withServer(start, fn) {
           }
           rounds.push(await sweeper.sweep())
         }
-        eq('O6d: the over-budget rate rewrites while the completed share stays high', JSON.stringify(rounds.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[3, 3, 2], [3, 3, 4], [3, 3, 6]]))
-        ok('O6d: every offload landed in the archive', existsSync(path.join(archiveDir, 'r00')) && existsSync(path.join(archiveDir, 'r13')))
-        eq('O6d: the file line count equals the reported balance', readFileSync(logPath, 'utf8').trim().split('\n').length, 6)
+        eq('budget-d: the over-budget rate rewrites while the completed share stays high', JSON.stringify(rounds.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[3, 3, 2], [3, 3, 4], [3, 3, 6]]))
+        ok('budget-d: every offload landed in the archive', existsSync(path.join(archiveDir, 'r00')) && existsSync(path.join(archiveDir, 'r13')))
+        eq('budget-d: the file line count equals the reported balance', readFileSync(logPath, 'utf8').trim().split('\n').length, 6)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
     }
   }
 
-  // -- O7: the trend alert (the consecutive over-envelope increments, the
+  // -- trend: the trend alert (the consecutive over-envelope increments, the
   //        healthy negatives, the out-of-regime dormant branch, the knob
   //        recovery)
   {
@@ -3639,9 +3639,9 @@ async function withServer(start, fn) {
           results.push(await sweeper.sweep())
         }
         const alerts = results.map((rp) => rp.trendAlert)
-        eq('O7a: the alert fires exactly on the K-th consecutive over-envelope sweep', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true, true]))
-        eq('O7a: the balance grows by the arrivals each round', results[12].balance, 13 * 60)
-        eq('O7a: the reported increment is the arrivals', results[12].increment, 60)
+        eq('trend-a: the alert fires exactly on the K-th consecutive over-envelope sweep', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true, true]))
+        eq('trend-a: the balance grows by the arrivals each round', results[12].balance, 13 * 60)
+        eq('trend-a: the reported increment is the arrivals', results[12].increment, 60)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3660,7 +3660,7 @@ async function withServer(start, fn) {
           for (let i = 0; i < burst; i++) await appendRetentionEntry(logPath, { id: `h${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
           results.push(await sweeper.sweep())
         }
-        ok('O7b: a burst shorter than K rounds never alerts', results.every((rp) => !rp.trendAlert))
+        ok('trend-b: a burst shorter than K rounds never alerts', results.every((rp) => !rp.trendAlert))
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3678,7 +3678,7 @@ async function withServer(start, fn) {
           for (let i = 0; i < 50; i++) await appendRetentionEntry(logPath, { id: `b${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
           results.push(await sweeper.sweep())
         }
-        ok('O7c: arrivals at exactly the budget never alert (the comparison is strict)', results.every((rp) => !rp.trendAlert))
+        ok('trend-c: arrivals at exactly the budget never alert (the comparison is strict)', results.every((rp) => !rp.trendAlert))
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -3717,9 +3717,9 @@ async function withServer(start, fn) {
           results.push(await sweeper.sweep())
         }
         const alerts = results.map((rp) => rp.trendAlert)
-        eq('O7d: the out-of-regime rate alerts after K consecutive rounds', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true]))
-        ok('O7d: the compaction trigger stayed dormant through the whole burst', results.every((rp) => rp.removedLines === 0 && rp.completedRatio < COMPACTION_RATIO))
-        eq('O7d: the deadweight backlog accumulated in the log file', readFileSync(logPath, 'utf8').trim().split('\n').length, 12 * 21)
+        eq('trend-d: the out-of-regime rate alerts after K consecutive rounds', JSON.stringify(alerts), JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true]))
+        ok('trend-d: the compaction trigger stayed dormant through the whole burst', results.every((rp) => rp.removedLines === 0 && rp.completedRatio < COMPACTION_RATIO))
+        eq('trend-d: the deadweight backlog accumulated in the log file', readFileSync(logPath, 'utf8').trim().split('\n').length, 12 * 21)
         // The operator raises the knob: a fresh instance (like a process
         // restart) re-derives the baseline and the streak starts over.
         sweeper = new OffloadSweeper({
@@ -3735,15 +3735,15 @@ async function withServer(start, fn) {
         for (let r = 0; r < 3; r++) {
           recovery.push(await sweeper.sweep())
         }
-        eq('O7d: the raised knob re-enables the compaction trigger and flushes the backlog', JSON.stringify(recovery.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[25, 85, 167], [25, 0, 167], [25, 50, 117]]))
-        ok('O7d: no trend alert under the recovered budget', recovery.every((rp) => !rp.trendAlert))
+        eq('trend-d: the raised knob re-enables the compaction trigger and flushes the backlog', JSON.stringify(recovery.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])), JSON.stringify([[25, 85, 167], [25, 0, 167], [25, 50, 117]]))
+        ok('trend-d: no trend alert under the recovered budget', recovery.every((rp) => !rp.trendAlert))
         const survivors = (await readRetentionLog(logPath)).entries
-        eq('O7d: only the pending (never-offloaded) lines survived the flush', survivors.length, 117)
+        eq('trend-d: only the pending (never-offloaded) lines survived the flush', survivors.length, 117)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
     }
-    // O7e: the alert line content (growth rate = (increment - cap) per sweep
+    // trend-e: the alert line content (growth rate = (increment - cap) per sweep
     // and the branch discriminator: dormant out-of-regime vs active in-regime).
     {
       for (const [arrivals, cap, dormant] of [[21, 5, true], [12, 10, false]]) {
@@ -3780,7 +3780,7 @@ async function withServer(start, fn) {
             ? ['growth rate 16/sweep', 'permanently dormant', 'completed lines are never evicted', 'check the offload batch knob first']
             : ['growth rate 2/sweep', 'still active', 'raise the offload batch knob or lower the dispatch rate']
           ok(
-            `O7e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`,
+            `trend-e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`,
             alert !== undefined && want.every((f) => alert.includes(f)),
             alert,
           )
@@ -3792,7 +3792,7 @@ async function withServer(start, fn) {
     }
   }
 
-  // -- O8: the periodic arming (the immediate first round, the disposer)
+  // -- arming: the periodic arming (the immediate first round, the disposer)
   {
     const home = mkdtempSync(path.join(os.tmpdir(), 'dsh-email-offload-'))
     try {
@@ -3800,16 +3800,16 @@ async function withServer(start, fn) {
       mkdirSync(storeRoot)
       const { sweeper, state } = makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() } })
       sweeper.start()
-      ok('O8a: start arms an immediate first round', await waitFor(() => state.infos.some((m) => m.includes('sweep done')), 2000))
+      ok('arming-a: start arms an immediate first round', await waitFor(() => state.infos.some((m) => m.includes('sweep done')), 2000))
       sweeper.start() // re-arming is a no-op
       sweeper.dispose()
-      ok('O8a: dispose stops the timer without error', true)
+      ok('arming-a: dispose stops the timer without error', true)
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
   }
 
-  // -- O9: the plugin integration (the write gate, the append failure, the
+  // -- lifecycle: the plugin integration (the write gate, the append failure, the
   //        disabled component, the shared in-flight set)
   async function tServer(fn, opts = {}) {
     const srv = await startImapServer(opts)
@@ -3839,25 +3839,25 @@ async function withServer(start, fn) {
         await withTriggerEnv(env, async () => {
           const { ctx, state } = fakeCtx(services)
           new DshEmailPlugin(ctx, {})
-          ok('O9a: the plugin registers the offload sweep effect', state.effects.some((e) => e.label === 'dsh-email offload sweep'))
+          ok('lifecycle-a: the plugin registers the offload sweep effect', state.effects.some((e) => e.label === 'dsh-email offload sweep'))
           await sleep(300) // let the immediate sweep round settle on the empty log
           const tStart = Date.now()
           srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
           srv.pushExists('INBOX', 1)
-          ok('O9a: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
+          ok('lifecycle-a: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
           const c = agents.creates[0]
           const tEnd = Date.now()
-          ok('O9a: the dispatched session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
-          eq('O9a: the dispatch carries the plugin workspace in the meta', c.meta?.cwd, path.join(home, 'dsh-email', 'workspace'))
+          ok('lifecycle-a: the dispatched session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+          eq('lifecycle-a: the dispatch carries the plugin workspace in the meta', c.meta?.cwd, path.join(home, 'dsh-email', 'workspace'))
           // The retention append is fire-and-forget: poll until it lands.
-           ok('O9b: the write gate logged exactly the dispatched session', await waitFor(async () => {
+           ok('lifecycle-b: the write gate logged exactly the dispatched session', await waitFor(async () => {
              if (!existsSync(logPath)) return false
              const r = await readRetentionLog(logPath)
              return r.entries.length === 1
            }, 4000))
           const line = (await readRetentionLog(logPath)).entries[0]
-          ok('O9b: the log line carries the session id, the unit, the dispatch time and the workspace', line.id === c.sessionId && line.unit === 'main' && line.cwd === c.meta.cwd && Date.parse(line.createdAt) >= tStart && Date.parse(line.createdAt) <= tEnd)
-          eq('O9b: the offload rounds stayed silent (healthy store)', state.warns.filter((m) => m.includes('offload')).length, 0)
+          ok('lifecycle-b: the log line carries the session id, the unit, the dispatch time and the workspace', line.id === c.sessionId && line.unit === 'main' && line.cwd === c.meta.cwd && Date.parse(line.createdAt) >= tStart && Date.parse(line.createdAt) <= tEnd)
+          eq('lifecycle-b: the offload rounds stayed silent (healthy store)', state.warns.filter((m) => m.includes('offload')).length, 0)
           for (const e of state.effects) e.dispose()
         })
       } finally {
@@ -3885,9 +3885,9 @@ async function withServer(start, fn) {
           await sleep(300)
           srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
           srv.pushExists('INBOX', 1)
-          ok('O9c: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
+          ok('lifecycle-c: the new mail is dispatched', await waitFor(() => agents.creates.length >= 1, 4000))
           await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1')))
-          eq('O9c: without a retention window the write gate logs nothing', existsSync(logPath), false)
+          eq('lifecycle-c: without a retention window the write gate logs nothing', existsSync(logPath), false)
           for (const e of state.effects) e.dispose()
         })
       } finally {
@@ -3917,9 +3917,9 @@ async function withServer(start, fn) {
           await sleep(300)
           srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
           srv.pushExists('INBOX', 1)
-          ok('O9d: a retention log write failure does not fail the dispatch', await waitFor(() => agents.creates.length >= 1, 4000))
-          ok('O9d: the session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
-          ok('O9d: the failed write is warned as an untracked session', state.warns.some((m) => m.includes('retention log') && m.includes('untracked')))
+          ok('lifecycle-d: a retention log write failure does not fail the dispatch', await waitFor(() => agents.creates.length >= 1, 4000))
+          ok('lifecycle-d: the session settles', await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1'))))
+          ok('lifecycle-d: the failed write is warned as an untracked session', state.warns.some((m) => m.includes('retention log') && m.includes('untracked')))
           for (const e of state.effects) e.dispose()
         })
       } finally {
@@ -3938,15 +3938,15 @@ async function withServer(start, fn) {
         services: { agents },
         inflight,
       })
-      ok('O9e: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
+      ok('lifecycle-e: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
       const id = agents.creates[0].sessionId
       await sleep(150)
-      ok('O9e: the unsettled session stays in the shared in-flight set', inflight.has(id) === true)
+      ok('lifecycle-e: the unsettled session stays in the shared in-flight set', inflight.has(id) === true)
       watcher.dispose()
       await sleep(150)
-      ok('O9e: the dispose detaches the dispatch without untracking it', inflight.has(id) === true)
-      ok('O9e: the detached dispatch settles on its own', agents.settleNext('completed') === true)
-      ok('O9e: the settlement removes the session from the set', await waitFor(() => inflight.has(id) === false, 4000))
+      ok('lifecycle-e: the dispose detaches the dispatch without untracking it', inflight.has(id) === true)
+      ok('lifecycle-e: the detached dispatch settles on its own', agents.settleNext('completed') === true)
+      ok('lifecycle-e: the settlement removes the session from the set', await waitFor(() => inflight.has(id) === false, 4000))
     }, { folders: { INBOX: { messages: [] } } })
     await tServer(async (srv) => {
       srv.state.folders.INBOX.messages.push(tm(1, 'A', 'a'))
@@ -3957,9 +3957,9 @@ async function withServer(start, fn) {
         services: { agents },
         inflight,
       })
-      ok('O9f: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
+      ok('lifecycle-f: the dispatched session is created', await waitFor(() => agents.creates.length >= 1, 4000))
       const id = agents.creates[0].sessionId
-      ok('O9f: the settled session leaves the in-flight set', (await waitFor(() => inflight.has(id) === false, 4000)) === true && state.infos.some((m) => m.includes('settled for uid 1')))
+      ok('lifecycle-f: the settled session leaves the in-flight set', (await waitFor(() => inflight.has(id) === false, 4000)) === true && state.infos.some((m) => m.includes('settled for uid 1')))
       watcher.dispose()
     }, { folders: { INBOX: { messages: [] } } })
     // The offload component disabled (no dshHomePath): a warning, no sweep,
@@ -3971,17 +3971,17 @@ async function withServer(start, fn) {
       await withTriggerEnv(env, async () => {
         const { ctx, state } = fakeCtx({ agents, sessionPersistence: makeSpService('/nonexistent-store'), sessions: makeRegistry() })
         new DshEmailPlugin(ctx, {})
-        ok('O9g: the disabled component warns at boot', state.warns.some((m) => m.includes('offload component is disabled')))
-        eq('O9g: no sweep effect is registered', state.effects.filter((e) => e.label === 'dsh-email offload sweep').length, 0)
-        ok('O9g: the trigger dispatch still works (workspace-less create)', await waitFor(() => agents.creates.length >= 1, 4000))
+        ok('lifecycle-g: the disabled component warns at boot', state.warns.some((m) => m.includes('offload component is disabled')))
+        eq('lifecycle-g: no sweep effect is registered', state.effects.filter((e) => e.label === 'dsh-email offload sweep').length, 0)
+        ok('lifecycle-g: the trigger dispatch still works (workspace-less create)', await waitFor(() => agents.creates.length >= 1, 4000))
         const c = agents.creates[0]
-        ok('O9g: the create carries no workspace meta', !('meta' in c))
+        ok('lifecycle-g: the create carries no workspace meta', !('meta' in c))
         await waitFor(() => state.infos.some((m) => m.includes('settled for uid 1')))
         for (const e of state.effects) e.dispose()
       })
     }, { folders: { INBOX: { messages: [] } } })
   }
-  // -- O10: the lost-retention-log startup warning (edge #10) and the
+  // -- logfault: the lost-retention-log startup warning and the
   //        append<->compaction mutex (the rewrite-window seam).
   {
     const mkSweeperCase = async (seed) => {
@@ -4013,13 +4013,13 @@ async function withServer(start, fn) {
       }
     }
     const fresh = await mkSweeperCase(() => {})
-    eq('O10a: a fresh install (no archive, no log) stays silent', fresh.length, 0)
+    eq('logfault-a: a fresh install (no archive, no log) stays silent', fresh.length, 0)
     const lost = await mkSweeperCase((archive) => {
       mkdirSync(path.join(archive, 'x'), { recursive: true })
       writeFileSync(path.join(archive, 'x', 'session.v4.jsonl.zstd'), 'log')
     })
-    ok('O10b: the lost log warns prominently on startup (exactly once across rounds)', lost.length === 1, lost)
-    // O10c: park the compaction rewrite between its temp write and its rename,
+    ok('logfault-b: the lost log warns prominently on startup (exactly once across rounds)', lost.length === 1, lost)
+    // logfault-c: park the compaction rewrite between its temp write and its rename,
     // append across the window, and prove the mutex serializes the append onto
     // the post-rename file (the line survives).
     {
@@ -4082,7 +4082,7 @@ async function withServer(start, fn) {
         clearInterval(keepAlive)
         const after = (await readRetentionLog(logPath)).entries
         ok(
-          'O10c: an append parked in the rewrite window survives the rewrite (the write mutex)',
+          'logfault-c: an append parked in the rewrite window survives the rewrite (the write mutex)',
           rep.removedLines === 4 && after.length === 2 && after.some((e) => e.id === liveId) && after.some((e) => e.id === 'mnew'),
           JSON.stringify([rep.removedLines, after.map((e) => e.id)]),
         )
