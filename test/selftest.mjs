@@ -44,7 +44,7 @@ const {
   LIMIT_MAX,
   registerTool,
 } = await import(path.join(PKG, 'lib', 'tool.js'))
-const { RAW_HEADERS_LIMIT, RAW_HEADERS_TRUNCATED, presentRawHeaders, quoteText } = await import(
+const { RAW_HEADERS_LIMIT, RAW_HEADERS_TRUNCATED, presentRawHeaders, presentBody, quoteText } = await import(
   path.join(PKG, 'lib', 'message.js')
 )
 const { DEFAULT_SAVE_DIR, sanitizeFilename } = await import(path.join(PKG, 'lib', 'save.js'))
@@ -617,16 +617,17 @@ function makePresetsService(spec = {}) {
  * createConnection seam (test-only: speeds up the IDLE-poll branch on
  * servers without the IDLE capability). `services` seeds ctx.get,
  * `createSession` overrides the session factory (default: the production
- * dispatcher, which then consumes the services). */
+ * dispatcher, which then consumes the services). `readBodyLimit` overrides
+ * the dispatch prompt's body budget (default: the parsed env value). */
 function startTriggerWatcher(
   srv,
-  { name = 'main', trigger, timeout, services = {}, createSession, autoIdleDelay, inflight, retention } = {},
+  { name = 'main', trigger, timeout, services = {}, createSession, autoIdleDelay, inflight, retention, readBodyLimit } = {},
 ) {
   const env = envOne(name, { imapPort: srv.port, smtpPort: 1, timeout, trigger })
   const cfg = parseEnv(env, () => {})
   const acct = cfg.accounts[0]
   const { ctx, state } = fakeCtx(services)
-  const opts = { ctx, account: acct, trigger: acct.trigger.config }
+  const opts = { ctx, account: acct, trigger: acct.trigger.config, readBodyLimit: readBodyLimit ?? cfg.readBodyLimit }
   if (inflight !== undefined) opts.inflight = inflight
   if (retention !== undefined) opts.retention = retention
   if (autoIdleDelay !== undefined) {
@@ -1049,6 +1050,16 @@ async function withServer(start, fn) {
 
         eq('rawHeaders unit: exact bound passes through', presentRawHeaders('a'.repeat(RAW_HEADERS_LIMIT)), 'a'.repeat(RAW_HEADERS_LIMIT))
         eq('rawHeaders unit: one over truncates with the marker', presentRawHeaders('a'.repeat(RAW_HEADERS_LIMIT + 1)).endsWith(RAW_HEADERS_TRUNCATED), true)
+        eq('presentBody unit: under the budget is complete', presentBody('abc', 5), { text: 'abc', truncated: false, totalLength: 3 })
+        eq('presentBody unit: exactly the budget is complete (no note)', presentBody('abcde', 5), { text: 'abcde', truncated: false, totalLength: 5 })
+        const over = presentBody('abcdefghij', 5)
+        eq('presentBody unit: over the budget cuts and carries the note', [over.text, over.truncated, over.totalLength, over.note], [
+          'abcde',
+          true,
+          10,
+          '[dsh-email: body truncated; 5 of 10 chars shown - call read for the full body]',
+        ])
+        eq('presentBody unit: an empty body stays an empty block', presentBody('', 5), { text: '', truncated: false, totalLength: 0 })
         eq('quoteText unit: line prefix and blank lines', quoteText({ firstTextContent: 'one\n\ntwo' }), '> one\n>\n> two')
       })(),
   )
@@ -2668,7 +2679,8 @@ async function withServer(start, fn) {
     })
   }, { folders: { INBOX: { messages: [] } } })
 
-  // -- W10: the three-part prompt, verbatim (no substitution, no excerpt)
+  // -- W10: the dispatch prompt carries the body block: the first text part
+  //         verbatim between the envelope line and the Policy block
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(...inboxMessages().slice(0, 1))
     const stub = makeSessionStub()
@@ -2681,16 +2693,193 @@ async function withServer(start, fn) {
       '<dsh-email trigger> New message in INBOX on account "main":',
       'uid 1 | INTERNALDATE 2026-10-01T10:00:00.000Z | From: one@example.com | Subject: First message',
       '',
+      'Body:',
+      'Hello body one.',
+      '',
       'Policy:',
       'Forward it to the on-call list.',
       '',
       '(Execution rules: dsh-email skill, "Trigger session" section.)',
     ].join('\n')
-    eq('W10: the prompt is the exact three-part template', stub.calls[0].params.prompt, expected)
+    eq('W10: the prompt is the exact template with the Body block', stub.calls[0].params.prompt, expected)
     eq('W10: the dispatch carries the account and folder', [stub.calls[0].params.account.name, stub.calls[0].params.trigger.folder], ['main', 'INBOX'])
     stub.settleNext()
     watcher.dispose()
   }, { folders: { INBOX: { messages: [] } } })
+
+  // The degraded prompt (no Body block), the exact envelope-only template:
+  // W20d (no text / html part) and W20e (body fetch degraded) assert it.
+  const degradedPrompt = (label, envelope) =>
+    [
+      label,
+      envelope,
+      '',
+      'Policy:',
+      'P',
+      '',
+      '(Execution rules: dsh-email skill, "Trigger session" section.)',
+    ].join('\n')
+
+  // -- W20a: a body under the budget: complete, no truncation marker
+  await tServer(async (srv) => {
+    const body = 'x'.repeat(500)
+    srv.state.folders.INBOX.messages.push(
+      makeMessage({
+        uid: 7,
+        flags: [],
+        internalDate: '2026-10-05T10:00:00Z',
+        from: { address: 'a@example.com' },
+        to: [{ address: 'agent@example.com' }],
+        subject: 'Complete body',
+        rawHeaders: 'From: a@example.com\r\nSubject: Complete body\r\n\r\n',
+        parts: { type: 'text/plain', charset: 'utf-8', cte: '7bit', body },
+      }),
+    )
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W20a: the mail with a body under the budget is dispatched', await waitFor(() => stub.calls.length >= 1))
+    const p = stub.calls[0].params.prompt
+    ok('W20a: the Body block carries the full body verbatim', p.includes(`\nBody:\n${body}\n\nPolicy:\n`), p)
+    ok('W20a: no truncation marker is present', !p.includes('body truncated'), p)
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W20b: a body over the budget: cut to the limit, the truncation note
+  //          reports the shown count and the total length
+  await tServer(async (srv) => {
+    const body = 'abcdefghij'.repeat(50) // 500 chars
+    const limit = 100
+    srv.state.folders.INBOX.messages.push(
+      makeMessage({
+        uid: 7,
+        flags: [],
+        internalDate: '2026-10-05T10:00:00Z',
+        from: { address: 'a@example.com' },
+        to: [{ address: 'agent@example.com' }],
+        subject: 'Long body',
+        rawHeaders: 'From: a@example.com\r\nSubject: Long body\r\n\r\n',
+        parts: { type: 'text/plain', charset: 'utf-8', cte: '7bit', body },
+      }),
+    )
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+      readBodyLimit: limit,
+    })
+    ok('W20b: the over-budget mail is dispatched', await waitFor(() => stub.calls.length >= 1))
+    const p = stub.calls[0].params.prompt
+    ok(
+      'W20b: the Body block is cut to the budget and carries the truncation note',
+      p.includes(`\nBody:\n${'abcdefghij'.repeat(10)}\n[dsh-email: body truncated; ${limit} of ${body.length} chars shown - call read for the full body]\n\nPolicy:\n`),
+      p,
+    )
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W20c: an html-only message: the Body block carries the raw html part
+  await tServer(async (srv) => {
+    const html = '<html><body><p>Feed note for the digest.</p></body></html>'
+    srv.state.folders.INBOX.messages.push(
+      makeMessage({
+        uid: 7,
+        flags: [],
+        internalDate: '2026-10-05T10:00:00Z',
+        from: { address: 'a@example.com' },
+        to: [{ address: 'agent@example.com' }],
+        subject: 'Html only',
+        rawHeaders: 'From: a@example.com\r\nSubject: Html only\r\n\r\n',
+        parts: { type: 'text/html', charset: 'utf-8', cte: '7bit', body: html },
+      }),
+    )
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W20c: the html-only mail is dispatched', await waitFor(() => stub.calls.length >= 1))
+    const p = stub.calls[0].params.prompt
+    ok('W20c: the Body block carries the raw html part', p.includes(`\nBody:\n${html}\n\nPolicy:\n`), p)
+    ok('W20c: no truncation marker is present', !p.includes('body truncated'), p)
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W20d: a message with no text / html part: the prompt degrades to the
+  //          envelope-only template (byte-identical to the pre-body shape)
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(
+      makeMessage({
+        uid: 7,
+        flags: [],
+        internalDate: '2026-10-05T10:00:00Z',
+        from: { address: 'a@example.com' },
+        to: [{ address: 'agent@example.com' }],
+        subject: 'Attachment only',
+        rawHeaders: 'From: a@example.com\r\nSubject: Attachment only\r\n\r\n',
+        parts: { type: 'application/octet-stream', cte: 'base64', disposition: 'attachment', filename: 'x.bin', body: 'x' },
+      }),
+    )
+    const stub = makeSessionStub()
+    const { watcher } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W20d: the attachment-only mail is dispatched', await waitFor(() => stub.calls.length >= 1))
+    eq(
+      'W20d: the prompt is the exact envelope-only template',
+      stub.calls[0].params.prompt,
+      degradedPrompt('<dsh-email trigger> New message in INBOX on account "main":', 'uid 7 | INTERNALDATE 2026-10-05T10:00:00.000Z | From: a@example.com | Subject: Attachment only'),
+    )
+    stub.settleNext()
+    watcher.dispose()
+  }, { folders: { INBOX: { messages: [] } } })
+
+  // -- W20e: the part download fails: the dispatch degrades (visible log)
+  //          and still proceeds with the envelope-only prompt
+  await tServer(async (srv) => {
+    srv.state.folders.INBOX.messages.push(
+      makeMessage({
+        uid: 7,
+        flags: [],
+        internalDate: '2026-10-05T10:00:00Z',
+        from: { address: 'a@example.com' },
+        to: [{ address: 'agent@example.com' }],
+        subject: 'Failing body',
+        rawHeaders: 'From: a@example.com\r\nSubject: Failing body\r\n\r\n',
+        // multipart on purpose: a multipart part download rides BODY.PEEK[<part>],
+        // which the failPartDownload injection can refuse (single-part downloads
+        // are served through the TEXT section and are exempt)
+        parts: { type: 'multipart/mixed', boundary: 'b', parts: [
+          { type: 'text/plain', charset: 'utf-8', cte: '7bit', body: 'A body that refuses to load.' },
+          { type: 'application/octet-stream', cte: 'base64', disposition: 'attachment', filename: 'x.bin', body: 'x' },
+        ] },
+      }),
+    )
+    const stub = makeSessionStub()
+    const { watcher, state } = startTriggerWatcher(srv, {
+      trigger: { enable: true, prompt: 'P', idleMs: 600000 },
+      createSession: stub.fn,
+    })
+    ok('W20e: the mail with a failing body fetch is dispatched', await waitFor(() => stub.calls.length >= 1))
+    const p = stub.calls[0].params.prompt
+    eq(
+      'W20e: the prompt degrades to the exact envelope-only template',
+      p,
+      degradedPrompt('<dsh-email trigger> New message in INBOX on account "main":', 'uid 7 | INTERNALDATE 2026-10-05T10:00:00.000Z | From: a@example.com | Subject: Failing body'),
+    )
+    ok('W20e: the degradation is a visible log entry', await waitFor(() => state.warns.some((m) => m.includes('uid 7') && m.includes('degraded')), 4000))
+    stub.settleNext()
+    watcher.dispose()
+  }, {
+    folders: { INBOX: { messages: [] } },
+    inject: { failPartDownload: { status: 'NO', text: 'part download refused' } },
+  })
 
   // -- W11: a named preset the host cannot resolve: create_failed, the uid
   //        is not slot-occupied, and each resync retries (visible logs)

@@ -67,6 +67,14 @@
 //                     covering the whole call)
 //   failCommand  - per-command tagged response override { status: 'NO' | 'BAD',
 //                  text } (protocol vs server classification)
+//   failPartDownload - FETCHes whose data items request a part's content
+//                  (BODY[<part>]; whole source, HEADER, .MIME and TEXT
+//                  sections are exempt - a single-part message download is
+//                  served through the TEXT section and is not affected) are
+//                  answered with the tagged override { status: 'NO' | 'BAD',
+//                  text } while the envelope / INTERNALDATE / BODYSTRUCTURE
+//                  fetches still succeed (refuses the trigger watcher's part
+//                  download)
 //   appendLimit  - APPEND sources larger than the limit are rejected (server)
 //   appendFailFirst - the first APPEND served by the server is rejected (NO)
 //                     and every later one succeeds; models a transient first
@@ -661,6 +669,20 @@ function handleImapSocket(socket, serverState) {
     if (out.length > 0) sendLine(`* ${seq} FETCH (${out.join(' ')})`)
   }
 
+  /** True when a FETCH item list requests a part's content: a BODY[<section>]
+   * (or RFC822) item whose section is neither the whole source, a header
+   * section, a part MIME section, nor the TEXT section. */
+  function hasPartBodyItem(items) {
+    for (const item of items) {
+      const m = item.match(/^(?:BODY|RFC822)(?:\.PEEK)?\[(.*?)\](?:<\d+\.\d+>)?$/i)
+      if (!m) continue
+      const section = (m[1] ?? '').toUpperCase()
+      if (section === '' || section === 'TEXT' || section.startsWith('HEADER') || section.endsWith('.MIME')) continue
+      return true
+    }
+    return false
+  }
+
   /** Apply one UID STORE flag operation to the selected folder. */
   function applyStore(range, modifier, flagTokens) {
     if (!selected) return
@@ -795,6 +817,11 @@ function handleImapSocket(socket, serverState) {
       const isUid = C.startsWith('UID ')
       const rangeTok = typeof args[0] === 'string' ? args[0] : '1'
       const items = parseFetchItems(cmd, rangeTok)
+      if (serverState.inject.failPartDownload && hasPartBodyItem(items)) {
+        const f = serverState.inject.failPartDownload
+        send(`${tag} ${f.status} ${f.text}`)
+        return
+      }
       const keys = expandSequenceSet(rangeTok)
       const folder = serverState.folders[selected]
       for (let i = 0; i < folder.messages.length; i++) {

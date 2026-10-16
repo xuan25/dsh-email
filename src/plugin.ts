@@ -288,7 +288,7 @@ export class DshEmailPlugin extends Service {
           : undefined
       ctx.effect(
         () => {
-          const watcher = new MailWatcher({ ctx, account: acct, trigger, inflight, retention })
+          const watcher = new MailWatcher({ ctx, account: acct, trigger, inflight, retention, readBodyLimit: cfg.readBodyLimit })
           watcher.start()
           return (): void => {
             watcher.dispose()

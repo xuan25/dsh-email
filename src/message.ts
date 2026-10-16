@@ -165,6 +165,37 @@ export function presentRawHeaders(headerBlock: string): string {
   return headerBlock.slice(0, RAW_HEADERS_LIMIT) + RAW_HEADERS_TRUNCATED
 }
 
+/**
+ * The trigger prompt Body block's truncation note (strict ASCII): it reports
+ * the budget, the pre-truncation length, and points at the read verb for the
+ * full body.
+ * @param limit the character budget applied.
+ * @param totalLength the pre-truncation body length.
+ */
+export function bodyTruncatedNote(limit: number, totalLength: number): string {
+  return `[dsh-email: body truncated; ${limit} of ${totalLength} chars shown - call read for the full body]`
+}
+
+/**
+ * Shape the trigger prompt's Body block: the decoded body capped at the
+ * presentation budget (the same budget as the read verb's body); a body of
+ * exactly the budget length is complete (the read verb's boundary), a longer
+ * one is cut at the budget and carries the truncation note. An empty body
+ * stays an empty block (no special case, the read verb's semantics).
+ * @param text the decoded body part content.
+ * @param limit the character budget.
+ */
+export function presentBody(text: string, limit: number): { text: string; truncated: boolean; totalLength: number; note?: string } {
+  const totalLength = text.length
+  if (totalLength <= limit) return { text, truncated: false, totalLength }
+  return {
+    text: text.slice(0, limit),
+    truncated: true,
+    totalLength,
+    note: bodyTruncatedNote(limit, totalLength),
+  }
+}
+
 function toAddressView(a?: { name?: string; address?: string }): AddressView | undefined {
   if (!a || !a.address) return undefined
   return a.name ? { name: a.name, address: a.address } : { address: a.address }
@@ -280,7 +311,7 @@ export async function fetchAndAnalyze(acct: AccountConfig, folder: string, uid: 
 
 /** Download one part through the session (PEEK) and decode it to text: the
  * delivered stream is consumed as-is, decoded with the delivered charset. */
-async function downloadPartText(session: ImapSession, uid: number, part: string): Promise<string | undefined> {
+export async function downloadPartText(session: ImapSession, uid: number, part: string): Promise<string | undefined> {
   const result = await session.client.download(String(uid), part, { uid: true })
   if (!result || !result.content) return undefined
   const buf = await toBuffer(result.content)

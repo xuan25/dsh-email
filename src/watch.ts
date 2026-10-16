@@ -31,6 +31,8 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { parse as parseYaml } from 'yaml'
 
 import { buildWatcherConnection } from './imap-client.js'
+import type { ImapSession } from './imap-client.js'
+import { downloadPartText, extractParts, presentBody } from './message.js'
 import type { AccountConfig, Context, Logger, TriggerConfig } from './types.js'
 import { errMsg, PLUGIN_NAME } from './util.js'
 
@@ -96,7 +98,7 @@ export interface DispatchParams {
   account: AccountConfig
   trigger: TriggerConfig
   uid: number
-  /** The fully rendered three-part prompt (envelope line filled by the watcher). */
+  /** The fully rendered trigger prompt (envelope line + optional body block filled by the watcher). */
   prompt: string
   owner: DispatchOwner
   /** Register the created session id as in-flight until settlement (offload liveness). */
@@ -123,6 +125,8 @@ export interface MailWatcherOptions {
   inflight?: Set<string>
   /** Retention log write seam (attached only when the account's retention window is enabled). */
   retention?: RetentionRecorder
+  /** The body budget for the trigger prompt's Body block (the plugin-level read-body limit). */
+  readBodyLimit: number
 }
 
 /** The live-agent runtime face the dispatcher drives (followup / settle / cancel / snapshot). */
@@ -351,7 +355,7 @@ async function resolveTriggerWorkspace(ctx: Context, logger: Logger): Promise<st
   }
 }
 
-/** The three-part prompt fields. */
+/** The trigger prompt fields. */
 export interface TriggerPromptFields {
   account: string
   folder: string
@@ -360,26 +364,38 @@ export interface TriggerPromptFields {
   internalDate: string
   from: string
   subject: string
+  /** The message body part (first text, else first html), presentation-shaped (budget-capped); absent in the degraded shape. */
+  body?: { text: string; truncated: boolean; totalLength: number; note?: string }
   /** The user's TRIGGER_PROMPT, verbatim (zero substitution). */
   policy: string
 }
 
 /**
- * The three-part minimal prompt: L1 = type label + account
- * + folder; L2 = the envelope data line (no body excerpt); the policy block
+ * The minimal trigger prompt: L1 = type label + account + folder;
+ * L2 = the envelope data line; the optional Body block = the message body
+ * part (first text, else first html) capped at the read-body budget (the
+ * truncation note is present only when the body was cut); the policy block
  * = the user prompt verbatim; the tail points at the skill's "Trigger
- * session" section for the execution rules.
+ * session" section for the execution rules. Without the body field the
+ * shape is byte-identical to the envelope-only form.
  */
 export function buildTriggerPrompt(f: TriggerPromptFields): string {
-  return [
+  const lines = [
     `<dsh-email trigger> New message in ${f.folder} on account "${f.account}":`,
     `uid ${f.uid} | INTERNALDATE ${f.internalDate} | From: ${f.from} | Subject: ${f.subject}`,
     '',
-    'Policy:',
-    f.policy,
-    '',
-    '(Execution rules: dsh-email skill, "Trigger session" section.)',
-  ].join('\n')
+  ]
+  if (f.body !== undefined) {
+    lines.push('Body:')
+    lines.push(f.body.text)
+    if (f.body.note !== undefined) lines.push(f.body.note)
+    lines.push('')
+  }
+  lines.push('Policy:')
+  lines.push(f.policy)
+  lines.push('')
+  lines.push('(Execution rules: dsh-email skill, "Trigger session" section.)')
+  return lines.join('\n')
 }
 
 /** The account log prefix shared by the watcher log and the dispatcher warnings. */
@@ -507,7 +523,7 @@ async function dispatchTriggerSession(p: DispatchParams): Promise<DispatchResult
     logger.warn(`${accountTag(account.name)}: the retention log write for session ${sessionId} failed (${errMsg(err)}); the session continues untracked`)
   }
 
-  // The first turn: the three-part prompt (envelope line rendered by the watcher).
+  // The first turn: the trigger prompt (envelope line + optional body block rendered by the watcher).
   const msg = createUserMessage({
     content: [{ type: 'text', text: prompt }],
     source: { kind: 'user' },
@@ -870,19 +886,20 @@ export class MailWatcher implements DispatchOwner {
     }
   }
 
-  /** One dispatch: fetch the envelope on the own connection, render the prompt, run the session. */
+  /** One dispatch: fetch the dispatch data on the own connection, render the prompt, run the session. */
   private async dispatchUid(uid: number): Promise<void> {
     let result: DispatchResult
     try {
-      const env = await this.fetchEnvelope(uid)
+      const data = await this.fetchDispatchData(uid)
       if (this.disposed) return
       const prompt = buildTriggerPrompt({
         account: this.account.name,
         folder: this.trigger.folder,
         uid,
-        internalDate: env.internalDate,
-        from: env.from,
-        subject: env.subject,
+        internalDate: data.internalDate,
+        from: data.from,
+        subject: data.subject,
+        ...(data.body !== undefined ? { body: data.body } : {}),
         policy: this.trigger.prompt,
       })
       const inflight = this.options.inflight
@@ -936,13 +953,29 @@ export class MailWatcher implements DispatchOwner {
     this.pumpQueue()
   }
 
-  /** The envelope of one uid on the watcher's own connection (no extra IMAP connection). */
-  private async fetchEnvelope(uid: number): Promise<{ from: string; subject: string; internalDate: string }> {
+  /**
+   * The dispatch data of one uid on the watcher's own connection (no extra
+   * IMAP connection): the envelope, plus - best effort - the first body part
+   * (first text part, else first html part) PEEK-downloaded and decoded to
+   * the presentation budget. A body-part download failure, or a message with
+   * no text / html part, leaves the body undefined: the dispatch proceeds
+   * with the degraded prompt and the session recovers the body through the
+   * read verb on its own connection. A transport failure of the download is
+   * swallowed (it is not the uniform-failure trigger): a dead resident
+   * connection surfaces on the next watcher command or the resync heartbeat
+   * and takes the existing reconnect path, so it is visible, not silent.
+   */
+  private async fetchDispatchData(uid: number): Promise<{
+    from: string
+    subject: string
+    internalDate: string
+    body?: { text: string; truncated: boolean; totalLength: number; note?: string }
+  }> {
     const client = this.client
     if (!client) throw new Error('watcher has no connection')
-    const messages = await client.fetchAll(String(uid), { envelope: true, internalDate: true }, { uid: true })
+    const messages = await client.fetchAll(String(uid), { envelope: true, internalDate: true, bodyStructure: true }, { uid: true })
     const msg = messages[0]
-    if (!msg) throw new Error(`uid ${uid} vanished before the envelope fetch`)
+    if (!msg) throw new Error(`uid ${uid} vanished before the dispatch fetch`)
     const envelope = msg.envelope
     const from = (envelope?.from?.[0]?.address as string | undefined) ?? ''
     const subject = (envelope?.subject as string | undefined) ?? ''
@@ -956,7 +989,24 @@ export class MailWatcher implements DispatchOwner {
     } else {
       internalDate = new Date(0).toISOString()
     }
-    return { from, subject, internalDate }
+    // The body part, on the same resident connection (capture stays empty:
+    // it is only consulted by the withImapSession connection layer, and this
+    // session's own command failures surface through the throw path above).
+    const extracted = extractParts(msg.bodyStructure)
+    const partNumber = extracted.textPartNumbers[0] ?? extracted.htmlPartNumbers[0]
+    let body: { text: string; truncated: boolean; totalLength: number; note?: string } | undefined
+    if (partNumber !== undefined) {
+      try {
+        const session: ImapSession = { client, capture: {} }
+        const text = await downloadPartText(session, uid, partNumber)
+        if (text !== undefined) body = presentBody(text, this.options.readBodyLimit)
+      } catch (err) {
+        this.logger.warn(
+          `${this.logTag()}: the body part fetch for uid ${uid} failed (${errMsg(err)}); dispatching with the degraded prompt`,
+        )
+      }
+    }
+    return { from, subject, internalDate, ...(body !== undefined ? { body } : {}) }
   }
 
   private logTag(): string {

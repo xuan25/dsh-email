@@ -110,7 +110,7 @@ EMAIL_LOCAL_TRIGGER_FOLDER=INBOX
 EMAIL_LOCAL_TRIGGER_MAX_CONCURRENT=1
 ```
 
-Each session receives a three-part prompt (no body excerpt): a type label naming account + folder, one envelope line (`uid | INTERNALDATE | From: | Subject:`), and the `TRIGGER_PROMPT` verbatim under a `Policy:` block. The session's execution rules (read the message, act on the policy, mark the message seen, summarize) live in the skill's "Trigger session" section.
+Each session receives a minimal prompt: a type label naming account + folder, one envelope line (`uid | INTERNALDATE | From: | Subject:`), the message body as a `Body:` block (the first text part, else the first html part, capped at the read-body budget `EMAIL_READ_BODY_LIMIT` - omitted when the message has no text / html part or the body fetch degrades, in which case the prompt is byte-identical to the envelope-only shape), and the `TRIGGER_PROMPT` verbatim under a `Policy:` block. The session's execution rules (get the body, act on the policy, mark the message seen, summarize) live in the skill's "Trigger session" section.
 
 - Dispatch state: up to `TRIGGER_MAX_CONCURRENT` sessions run at once; newer mails wait in a FIFO queue of at most `TRIGGER_QUEUE_MAX`; beyond that the overflow is a visible log entry and the mail simply stays UNSEEN (retried on a later resync).
 - Session route: each trigger session is created with the deployment's default model route when one resolves; `TRIGGER_REASONING_EFFORT` sets the session's reasoning effort (closed set, absent = the framework provider default), passed through to the framework's agent options.
