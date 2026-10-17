@@ -371,30 +371,33 @@ export interface TriggerPromptFields {
 }
 
 /**
- * The minimal trigger prompt: L1 = type label + account + folder;
- * L2 = the envelope data line; the optional Body block = the message body
- * part (first text, else first html) capped at the read-body budget (the
- * truncation note is present only when the body was cut); the policy block
- * = the user prompt verbatim; the tail points at the skill's "Trigger
- * session" section for the execution rules. Without the body field the
- * shape is byte-identical to the envelope-only form.
+ * The minimal trigger prompt, laid out static-first (the shared
+ * static -> dynamic layering convention of the sibling trigger plugins):
+ * the type label line (always line one: skill matching and trigger-session
+ * self-identification depend on it), the Policy block (the user prompt
+ * verbatim) and the execution-rules pointer form the static layer; the
+ * envelope data line and the optional Body block (the message body part,
+ * first text else first html, capped at the read-body budget; the
+ * truncation note is present only when the body was cut) form the dynamic
+ * layer. Without the body field the prompt ends at the envelope line
+ * (the degraded, envelope-only shape).
  */
 export function buildTriggerPrompt(f: TriggerPromptFields): string {
   const lines = [
     `<dsh-email trigger> New message in ${f.folder} on account "${f.account}":`,
-    `uid ${f.uid} | INTERNALDATE ${f.internalDate} | From: ${f.from} | Subject: ${f.subject}`,
     '',
+    'Policy:',
+    f.policy,
+    '(Execution rules: dsh-email skill, "Trigger session" section.)',
+    '',
+    `uid ${f.uid} | INTERNALDATE ${f.internalDate} | From: ${f.from} | Subject: ${f.subject}`,
   ]
   if (f.body !== undefined) {
+    lines.push('')
     lines.push('Body:')
     lines.push(f.body.text)
     if (f.body.note !== undefined) lines.push(f.body.note)
-    lines.push('')
   }
-  lines.push('Policy:')
-  lines.push(f.policy)
-  lines.push('')
-  lines.push('(Execution rules: dsh-email skill, "Trigger session" section.)')
   return lines.join('\n')
 }
 

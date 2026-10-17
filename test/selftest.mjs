@@ -2679,8 +2679,9 @@ async function withServer(start, fn) {
     })
   }, { folders: { INBOX: { messages: [] } } })
 
-  // -- W10: the dispatch prompt carries the body block: the first text part
-  //         verbatim between the envelope line and the Policy block
+  // -- W10: the dispatch prompt is laid out static-first (label, Policy,
+  //         rules pointer, then the envelope line and the Body block: the
+  //         first text part verbatim)
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(...inboxMessages().slice(0, 1))
     const stub = makeSessionStub()
@@ -2691,15 +2692,15 @@ async function withServer(start, fn) {
     ok('W10: the unseen mail is dispatched', await waitFor(() => stub.calls.length >= 1))
     const expected = [
       '<dsh-email trigger> New message in INBOX on account "main":',
+      '',
+      'Policy:',
+      'Forward it to the on-call list.',
+      '(Execution rules: dsh-email skill, "Trigger session" section.)',
+      '',
       'uid 1 | INTERNALDATE 2026-10-01T10:00:00.000Z | From: one@example.com | Subject: First message',
       '',
       'Body:',
       'Hello body one.',
-      '',
-      'Policy:',
-      'Forward it to the on-call list.',
-      '',
-      '(Execution rules: dsh-email skill, "Trigger session" section.)',
     ].join('\n')
     eq('W10: the prompt is the exact template with the Body block', stub.calls[0].params.prompt, expected)
     eq('W10: the dispatch carries the account and folder', [stub.calls[0].params.account.name, stub.calls[0].params.trigger.folder], ['main', 'INBOX'])
@@ -2712,12 +2713,12 @@ async function withServer(start, fn) {
   const degradedPrompt = (label, envelope) =>
     [
       label,
-      envelope,
       '',
       'Policy:',
       'P',
-      '',
       '(Execution rules: dsh-email skill, "Trigger session" section.)',
+      '',
+      envelope,
     ].join('\n')
 
   // -- W20a: a body under the budget: complete, no truncation marker
@@ -2742,7 +2743,7 @@ async function withServer(start, fn) {
     })
     ok('W20a: the mail with a body under the budget is dispatched', await waitFor(() => stub.calls.length >= 1))
     const p = stub.calls[0].params.prompt
-    ok('W20a: the Body block carries the full body verbatim', p.includes(`\nBody:\n${body}\n\nPolicy:\n`), p)
+    ok('W20a: the Body block carries the full body verbatim (dynamic layer, tail of the prompt)', p.endsWith(`\nBody:\n${body}`), p)
     ok('W20a: no truncation marker is present', !p.includes('body truncated'), p)
     stub.settleNext()
     watcher.dispose()
@@ -2774,8 +2775,8 @@ async function withServer(start, fn) {
     ok('W20b: the over-budget mail is dispatched', await waitFor(() => stub.calls.length >= 1))
     const p = stub.calls[0].params.prompt
     ok(
-      'W20b: the Body block is cut to the budget and carries the truncation note',
-      p.includes(`\nBody:\n${'abcdefghij'.repeat(10)}\n[dsh-email: body truncated; ${limit} of ${body.length} chars shown - call read for the full body]\n\nPolicy:\n`),
+      'W20b: the Body block is cut to the budget and carries the truncation note (dynamic layer, tail of the prompt)',
+      p.endsWith(`\nBody:\n${'abcdefghij'.repeat(10)}\n[dsh-email: body truncated; ${limit} of ${body.length} chars shown - call read for the full body]`),
       p,
     )
     stub.settleNext()
@@ -2804,14 +2805,15 @@ async function withServer(start, fn) {
     })
     ok('W20c: the html-only mail is dispatched', await waitFor(() => stub.calls.length >= 1))
     const p = stub.calls[0].params.prompt
-    ok('W20c: the Body block carries the raw html part', p.includes(`\nBody:\n${html}\n\nPolicy:\n`), p)
+    ok('W20c: the Body block carries the raw html part (dynamic layer, tail of the prompt)', p.endsWith(`\nBody:\n${html}`), p)
     ok('W20c: no truncation marker is present', !p.includes('body truncated'), p)
     stub.settleNext()
     watcher.dispose()
   }, { folders: { INBOX: { messages: [] } } })
 
   // -- W20d: a message with no text / html part: the prompt degrades to the
-  //          envelope-only template (byte-identical to the pre-body shape)
+  //          static-layer template (label / Policy / pointer / envelope; the
+  //          Body block is simply absent, all other blocks keep their order)
   await tServer(async (srv) => {
     srv.state.folders.INBOX.messages.push(
       makeMessage({
